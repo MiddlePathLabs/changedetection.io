@@ -314,6 +314,10 @@ def register_builtin_fetchers():
     if hasattr(webdriver_selenium, 'webdriver_selenium_plugin'):
         plugin_manager.register(webdriver_selenium.webdriver_selenium_plugin, 'builtin_webdriver_selenium')
 
+    from changedetectionio.content_fetchers import scrapling_http
+    if scrapling_http.scrapling_is_available():
+        plugin_manager.register(scrapling_http.scrapling_http_plugin, 'builtin_scrapling_http')
+
 
 def register_builtin_restock_plugins():
     """Register built-in restock processor plugins after all imports are complete.

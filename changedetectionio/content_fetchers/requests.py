@@ -12,6 +12,51 @@ from changedetectionio.content_fetchers.base import Fetcher
 from changedetectionio.validate_url import is_fetch_url_allowed, is_private_hostname, is_url_private_or_parser_confused
 
 
+def sniff_encoding(content, content_type, url=None):
+    """Work out the text encoding of a response that had no charset in its Content-Type header.
+
+    Shared by the HTTP (non-browser) fetchers, returns None when nothing could be guessed.
+    """
+    import chardet
+
+    # For XML/RSS feeds, check the XML declaration for encoding attribute
+    # This is more reliable than chardet which can misdetect UTF-8 as MacRoman
+    content_type = (content_type or '').lower()
+    if 'xml' in content_type or 'rss' in content_type:
+        # Look for <?xml version="1.0" encoding="UTF-8"?>
+        xml_encoding_match = re.search(rb'<\?xml[^>]+encoding=["\']([^"\']+)["\']', content[:200])
+        if xml_encoding_match:
+            return xml_encoding_match.group(1).decode('ascii')
+        # Default to UTF-8 for XML if no encoding found
+        return 'utf-8'
+
+    # No charset in HTTP header - sniff encoding in priority order matching browsers
+    # (WHATWG encoding sniffing algorithm):
+    # 1. BOM - highest confidence, check before anything else
+    # 2. <meta charset> in first 2kb
+    # 3. chardet statistical detection - last resort
+    # See: https://github.com/dgtlmoon/changedetection.io/issues/3952
+    boms = [
+        (b'\xef\xbb\xbf', 'utf-8-sig'),
+        (b'\xff\xfe', 'utf-16-le'),
+        (b'\xfe\xff', 'utf-16-be'),
+    ]
+    bom_encoding = next((enc for bom, enc in boms if content.startswith(bom)), None)
+    if bom_encoding:
+        logger.info(f"URL: {url} Using encoding '{bom_encoding}' detected from BOM")
+        return bom_encoding
+
+    meta_charset_match = re.search(rb'<meta[^>]+charset\s*=\s*["\']?\s*([^"\'\s;>]+)', content[:2000], re.IGNORECASE)
+    if meta_charset_match:
+        encoding = meta_charset_match.group(1).decode('ascii', errors='ignore')
+        logger.info(f"URL: {url} No content-type encoding in HTTP headers - Using encoding '{encoding}' from HTML meta charset tag")
+        return encoding
+
+    encoding = chardet.detect(content)['encoding']
+    logger.warning(f"URL: {url} No charset in headers or meta tag, guessed encoding as '{encoding}' via chardet")
+    return encoding
+
+
 # "html_requests" is listed as the default fetcher in store.py!
 class fetcher(Fetcher):
     fetcher_description = _l("Basic fast Plaintext/HTTP Client")
@@ -35,7 +80,6 @@ class fetcher(Fetcher):
             ):
         """Synchronous version of run - the original requests implementation"""
 
-        import chardet
         import requests
         from requests.exceptions import ProxyError, ConnectionError, RequestException
 
@@ -138,44 +182,9 @@ class fetcher(Fetcher):
         if not is_binary:
             # Don't run this for PDF (and requests identified as binary) takes a _long_ time
             if not r.headers.get('content-type') or not 'charset=' in r.headers.get('content-type'):
-                # For XML/RSS feeds, check the XML declaration for encoding attribute
-                # This is more reliable than chardet which can misdetect UTF-8 as MacRoman
-                content_type = r.headers.get('content-type', '').lower()
-                if 'xml' in content_type or 'rss' in content_type:
-                    # Look for <?xml version="1.0" encoding="UTF-8"?>
-                    xml_encoding_match = re.search(rb'<\?xml[^>]+encoding=["\']([^"\']+)["\']', r.content[:200])
-                    if xml_encoding_match:
-                        r.encoding = xml_encoding_match.group(1).decode('ascii')
-                    else:
-                        # Default to UTF-8 for XML if no encoding found
-                        r.encoding = 'utf-8'
-                else:
-                    # No charset in HTTP header - sniff encoding in priority order matching browsers
-                    # (WHATWG encoding sniffing algorithm):
-                    # 1. BOM - highest confidence, check before anything else
-                    # 2. <meta charset> in first 2kb
-                    # 3. chardet statistical detection - last resort
-                    # See: https://github.com/dgtlmoon/changedetection.io/issues/3952
-                    boms = [
-                        (b'\xef\xbb\xbf', 'utf-8-sig'),
-                        (b'\xff\xfe', 'utf-16-le'),
-                        (b'\xfe\xff', 'utf-16-be'),
-                    ]
-                    bom_encoding = next((enc for bom, enc in boms if r.content.startswith(bom)), None)
-                    if bom_encoding:
-                        logger.info(f"URL: {url} Using encoding '{bom_encoding}' detected from BOM")
-                        r.encoding = bom_encoding
-                    else:
-                        meta_charset_match = re.search(rb'<meta[^>]+charset\s*=\s*["\']?\s*([^"\'\s;>]+)', r.content[:2000], re.IGNORECASE)
-                        if meta_charset_match:
-                            encoding = meta_charset_match.group(1).decode('ascii', errors='ignore')
-                            logger.info(f"URL: {url} No content-type encoding in HTTP headers - Using encoding '{encoding}' from HTML meta charset tag")
-                            r.encoding = encoding
-                        else:
-                            encoding = chardet.detect(r.content)['encoding']
-                            logger.warning(f"URL: {url} No charset in headers or meta tag, guessed encoding as '{encoding}' via chardet")
-                            if encoding:
-                                r.encoding = encoding
+                encoding = sniff_encoding(content=r.content, content_type=r.headers.get('content-type', ''), url=url)
+                if encoding:
+                    r.encoding = encoding
 
         self.headers = r.headers
 

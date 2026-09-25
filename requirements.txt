@@ -78,6 +78,9 @@ elementpath==5.1.1
 
 selenium~=4.49.0
 
+# Scrapling ('html_scrapling' fetcher) is installed at Dockerfile build time, like playwright, because
+# curl_cffi/patchright are not available on all platforms. The fetcher is only offered when importable.
+
 # Templating, so far just in the URLs but in the future can be for the notifications also
 jinja2~=3.1
 arrow
