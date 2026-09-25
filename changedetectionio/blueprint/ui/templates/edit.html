@@ -30,6 +30,7 @@
     const default_system_fetch_backend="{{ settings_application['fetch_backend'] }}";
 </script>
 <script src="{{url_for('static_content', group='js', filename='plugins.js')}}" defer></script>
+<script src="{{url_for('static_content', group='js', filename='ai-assist.js')}}" defer></script>
 <script src="{{url_for('static_content', group='js', filename='watch-settings.js')}}" defer></script>
 <script src="{{url_for('static_content', group='js', filename='notifications.js')}}" defer></script>
 <script src="{{url_for('static_content', group='js', filename='visual-selector.js')}}" defer></script>
@@ -343,6 +344,7 @@ Math: {{ 1 + 1 }}") }}
             {% if not llm_features_disabled %}
             <div class="tab-pane-inner" id="ai-llm">
                 {% include "edit/include_llm_intent.html" %}
+                {% include "edit/include_ai_assist.html" %}
             </div>
             {% endif %}
             <div class="tab-pane-inner" id="filters-and-triggers">

@@ -176,6 +176,9 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, worker_pool, 
     preview_blueprint = preview.construct_blueprint(datastore)
     ui_blueprint.register_blueprint(preview_blueprint)
 
+    from changedetectionio.blueprint.ui.ai_assist import construct_blueprint as construct_ai_assist_blueprint
+    ui_blueprint.register_blueprint(construct_ai_assist_blueprint(datastore))
+
     queue_blueprint = construct_queue_blueprint(datastore, update_q)
     ui_blueprint.register_blueprint(queue_blueprint)
 

@@ -1,0 +1,65 @@
+{#
+  AI setup assistant - watch edit page only (see llm/assist.py, blueprint/ui/ai_assist.py).
+  Suggestions are put into the form fields on the other tabs; nothing is stored until Save.
+
+  Required context: watch, uuid, llm_configured
+#}
+{% if llm_configured and (not watch.get('processor') or watch.get('processor') in ['text_json_diff', 'restock_diff']) %}
+<div class="border-fieldset" id="ai-assist"
+     data-url="{{ url_for('ui.ui_ai_assist.watch_ai_assist', uuid=uuid, kind='__KIND__') }}">
+    <h3 style="margin-top:0">&#x2728; {{ _('AI setup assistant') }}</h3>
+    <p class="pure-form-message-inline" style="margin-top:0">
+        {{ _('Each button asks the AI once, using the saved page and history. Suggestions are checked against the real page first, and are only added to the form when you choose. Nothing changes until you press Save.') }}
+    </p>
+
+    {% if watch.get('last_error') or watch.get('consecutive_filter_failures') or watch.get('browser_steps_last_error_step') %}
+    <div class="ai-assist-row">
+        <button type="button" class="pure-button button-xsmall pure-button-primary" data-ai-assist="diagnose">{{ _('Explain this error') }}</button>
+        <span class="pure-form-message-inline">{{ _('Why this watch is failing, and how to fix it.') }}</span>
+    </div>
+    {% endif %}
+
+    <div class="ai-assist-row">
+        <button type="button" class="pure-button button-xsmall" data-ai-assist="filters">{{ _('Suggest filters') }}</button>
+        <input type="text" id="ai-assist-goal" class="pure-input-1-2" maxlength="2000"
+               placeholder="{{ _('What do you want to watch on this page? (defaults to the AI Change Intent above)') }}">
+    </div>
+    <div class="ai-assist-row">
+        <button type="button" class="pure-button button-xsmall" data-ai-assist="noise">{{ _('Find noisy lines') }}</button>
+        <span class="pure-form-message-inline">{{ _('Looks at recent history for lines that keep changing without meaning (times, counters) and suggests text to ignore.') }}</span>
+    </div>
+    <div class="ai-assist-row">
+        <button type="button" class="pure-button button-xsmall" data-ai-assist="tags">{{ _('Suggest groups') }}</button>
+        <span class="pure-form-message-inline">{{ _('Suggests which groups (tags) this watch belongs in.') }}</span>
+    </div>
+
+    <div id="ai-assist-result" aria-live="polite"></div>
+</div>
+<style>
+    #ai-assist .ai-assist-row { display: flex; gap: 0.6em; align-items: center; flex-wrap: wrap; margin: 0.5em 0; }
+    #ai-assist .ai-assist-row .pure-form-message-inline { padding-left: 0; }
+    #ai-assist-result { margin-top: 0.8em; }
+    #ai-assist-result .ai-assist-group { margin: 0.6em 0; }
+    #ai-assist-result code { word-break: break-all; }
+</style>
+<script>
+    window.ai_assist_i18n = {
+        working: {{ _('Asking the AI…')|tojson }},
+        failed: {{ _('Request failed')|tojson }},
+        nothing: {{ _('No suggestions - nothing useful was found, or nothing the AI proposed matched the page.')|tojson }},
+        add: {{ _('Add selected')|tojson }},
+        added: {{ _('Added to the form - press Save to keep it.')|tojson }},
+        include_filters: {{ _('CSS/XPath filters')|tojson }},
+        subtractive_selectors: {{ _('Remove elements')|tojson }},
+        ignore_text: {{ _('Ignore lines containing')|tojson }},
+        trigger_text: {{ _('Trigger text')|tojson }},
+        tags: {{ _('Groups')|tojson }},
+        match: {{ _('match')|tojson }},
+        matches: {{ _('matches')|tojson }},
+        new_group: {{ _('new group')|tojson }},
+        avoided: {{ _('With these rules, %(n)s of the last %(m)s changes would not have been reported.')|tojson }},
+        fixes: {{ _('Suggested fixes')|tojson }},
+        based_on: {{ _('Based on')|tojson }}
+    };
+</script>
+{% endif %}
