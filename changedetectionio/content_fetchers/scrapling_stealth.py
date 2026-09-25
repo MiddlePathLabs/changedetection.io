@@ -92,8 +92,13 @@ class fetcher(Fetcher):
                     request = route.request
                     if request.is_navigation_request() and \
                             await asyncio.to_thread(is_url_private_or_parser_confused, request.url):
-                        captured['blocked_url'] = request.url
                         await route.abort('blockedbyclient')
+                        # Only the page itself going somewhere private is an error. iframes (ads, trackers) are just
+                        # dropped, DNS ad-blockers (Pi-hole etc) resolve those to 0.0.0.0 which counts as reserved.
+                        if request.frame == page.main_frame:
+                            captured['blocked_url'] = request.url
+                        else:
+                            logger.debug(f"Blocked iframe navigation to private/reserved address '{request.url}' on {url}")
                         return
                     await route.fallback()
 
