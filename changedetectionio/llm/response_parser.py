@@ -62,25 +62,49 @@ def _extract_json(raw: str) -> str:
     # Remove ```json ... ``` or ``` ... ``` fences
     raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
     raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
-    # Find the first { ... } block
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    return match.group(0) if match else raw
+    # Decode the first complete JSON object. raw_decode stops at the object's own closing
+    # brace, so trailing prose containing braces ("Note: {x}") can't swallow it the way a
+    # greedy \{.*\} regex does. Try each '{' in turn so a stray brace in a preamble is skipped.
+    decoder = json.JSONDecoder()
+    for m in re.finditer(r'\{', raw):
+        try:
+            obj, end = decoder.raw_decode(raw, m.start())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return raw[m.start():end]
+    return raw
+
+
+def parse_json_object(raw: str) -> dict:
+    """Extract and decode the JSON object from an LLM reply.
+
+    Raises ValueError (json.JSONDecodeError is a subclass) when there is no usable object:
+    empty content, prose only, truncated JSON, or an unterminated reasoning block.
+    """
+    data = json.loads(_extract_json(raw or ''))
+    if not isinstance(data, dict):
+        raise ValueError('LLM response JSON is not an object')
+    return data
 
 
 def parse_eval_response(raw: str) -> dict:
     """
     Parse a diff evaluation response.
     Returns {'important': bool, 'summary': str}.
-    Falls back to important=False on any parse error.
+
+    Raises ValueError when the response can't be parsed. This is deliberately NOT a
+    silent important=False: an empty or truncated reply (typically a reasoning model that
+    ran out of max_tokens) would otherwise suppress a real change, and the evaluator would
+    cache that non-answer for good. evaluate_change catches this and fails open.
     """
-    try:
-        data = json.loads(_extract_json(raw))
-        return {
-            'important': _to_bool(data.get('important'), default=False),
-            'summary': str(data.get('summary', '')).strip(),
-        }
-    except (json.JSONDecodeError, AttributeError):
-        return {'important': False, 'summary': ''}
+    data = parse_json_object(raw)
+    if 'important' not in data:
+        raise ValueError('LLM evaluation response has no "important" key')
+    return {
+        'important': _to_bool(data.get('important'), default=False),
+        'summary': str(data.get('summary', '')).strip(),
+    }
 
 
 def parse_preview_response(raw: str) -> dict:
@@ -90,12 +114,12 @@ def parse_preview_response(raw: str) -> dict:
     Falls back to found=False on any parse error.
     """
     try:
-        data = json.loads(_extract_json(raw))
+        data = parse_json_object(raw)
         return {
             'found': _to_bool(data.get('found'), default=False),
             'answer': str(data.get('answer', '')).strip(),
         }
-    except (json.JSONDecodeError, AttributeError):
+    except ValueError:
         return {'found': False, 'answer': ''}
 
 
@@ -106,7 +130,7 @@ def parse_setup_response(raw: str) -> dict:
     Rejects positional selectors even if the LLM generates them.
     """
     try:
-        data = json.loads(_extract_json(raw))
+        data = parse_json_object(raw)
         needs = _to_bool(data.get('needs_prefilter'), default=False)
         selector = data.get('selector') or None
 
@@ -120,5 +144,5 @@ def parse_setup_response(raw: str) -> dict:
             'selector': selector if needs else None,
             'reason': str(data.get('reason', '')).strip(),
         }
-    except (json.JSONDecodeError, AttributeError):
+    except (ValueError, TypeError):
         return {'needs_prefilter': False, 'selector': None, 'reason': ''}

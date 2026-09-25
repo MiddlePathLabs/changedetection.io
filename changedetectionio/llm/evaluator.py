@@ -86,6 +86,32 @@ def _check_input_size(text: str, max_chars: int) -> None:
         )
 
 
+# Gemini models whose thinking cannot be switched off (thinkingBudget=0 is rejected).
+_GEMINI_CANNOT_DISABLE_THINKING = ('gemini-2.5-pro', 'gemini-3')
+
+
+_DIFF_TRIM_MARKER = '\n[... diff truncated to fit the AI input limit ...]'
+
+
+def fit_diff_to_budget(diff: str, max_chars: int) -> str:
+    """Shrink a diff to max_chars instead of refusing it.
+
+    Refusing (LLMInputTooLargeError) meant the very changes most worth a second look - big
+    page rewrites - silently skipped intent filtering and got no summary at all. Unchanged
+    context lines go first since they carry the least signal; if the +/- lines alone still
+    don't fit, the tail is cut and marked so the model knows it is looking at a partial diff.
+    """
+    if len(diff) <= max_chars:
+        return diff
+    changed = [ln for ln in diff.splitlines() if ln.startswith(('+', '-', '~', '@@', '==='))]
+    trimmed = '\n'.join(changed)
+    if len(trimmed) <= max_chars:
+        return trimmed
+    keep = max(0, max_chars - len(_DIFF_TRIM_MARKER))
+    cut = trimmed.rfind('\n', 0, keep)
+    return trimmed[:cut if cut > 0 else keep] + _DIFF_TRIM_MARKER
+
+
 def _thinking_extra_body(model: str, budget: int) -> dict | None:
     """Return litellm extra_body to control thinking for models that support it.
 
@@ -99,6 +125,10 @@ def _thinking_extra_body(model: str, budget: int) -> dict | None:
     if not model.startswith('gemini/'):
         return None
     if 'flash-lite' in model.lower():
+        return None
+    if budget <= 0 and any(k in model.lower() for k in _GEMINI_CANNOT_DISABLE_THINKING):
+        # These reject thinkingBudget=0 with a 400. The client would strip it and retry,
+        # so skip the wasted round trip; they get reasoning headroom via _is_reasoning_model.
         return None
     try:
         import litellm
@@ -168,7 +198,62 @@ def _summary_max_tokens(diff: str, max_cap: int = LLM_DEFAULT_MAX_SUMMARY_TOKENS
 # Models that emit chain-of-thought before the answer, on any provider. Reasoning tokens are
 # billed and counted against max_tokens, so these need headroom or the answer never lands.
 # Kept in step with client._NO_TEMPERATURE_MODEL_KEYWORDS - reasoning is what drives both.
-REASONING_MODEL_KEYWORDS = ('o1', 'o3', 'o4', 'gpt-5', 'thinking-exp')
+REASONING_MODEL_KEYWORDS = (
+    'o1', 'o3', 'o4', 'gpt-5', 'thinking-exp',
+    # Reasoning-by-default families on other providers / aggregators (OpenRouter, DeepSeek,
+    # Groq, xAI, Mistral...). Their answer lands after the chain-of-thought, same problem.
+    'deepseek-r1', 'deepseek-reasoner', 'qwq', 'qwen3', 'magistral', 'grok-3-mini', 'grok-4',
+    'gpt-oss', 'gemini-2.5-pro', 'gemini-3',
+)
+
+# Claude only reasons when extended thinking is requested, which we never do, so litellm's
+# supports_reasoning=True for it must not bump its cap.
+_REASONING_OPT_IN_ONLY_PREFIXES = ('claude', 'anthropic/', 'bedrock/anthropic', 'vertex_ai/claude')
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """Does this model spend output tokens on reasoning before answering?
+
+    Keyword list first (fast, covers aliases litellm doesn't know), then litellm's model
+    registry so newly released reasoning models are picked up without a code change. The
+    registry is read directly rather than via litellm.supports_reasoning(), which prints a
+    provider-list banner to stdout for every model it can't place (Ollama, custom endpoints).
+    """
+    m = (model or '').lower()
+    if not m:
+        return False
+    if any(k in m for k in REASONING_MODEL_KEYWORDS):
+        return True
+    if m.startswith(_REASONING_OPT_IN_ONLY_PREFIXES):
+        return False
+    try:
+        import litellm
+        registry = getattr(litellm, 'model_cost', None) or {}
+        candidates = [model, m]
+        if '/' in m:
+            candidates.append(m.split('/', 1)[1])
+        for name in candidates:
+            info = registry.get(name)
+            if isinstance(info, dict) and info.get('supports_reasoning'):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_self_hosted_config(llm_cfg: dict) -> bool:
+    """Ollama / OpenAI-compatible / anything on a LAN address.
+
+    provider_kind is only set by the settings UI. When the model comes from LLM_MODEL /
+    LLM_API_BASE env vars there is no provider_kind, so an env-configured Ollama used to get
+    none of the headroom its reasoning models need - fall back to the model prefix and the
+    api_base host.
+    """
+    if llm_cfg.get('provider_kind') in ('ollama', 'openai_compatible'):
+        return True
+    if (llm_cfg.get('model') or '').lower().startswith(('ollama/', 'ollama_chat/')):
+        return True
+    return _is_local_llm_endpoint(llm_cfg)
 
 
 def apply_local_token_multiplier(base_max_tokens: int, llm_cfg: dict) -> int:
@@ -202,11 +287,7 @@ def apply_local_token_multiplier(base_max_tokens: int, llm_cfg: dict) -> int:
     Multiplier defaults to 5x and is user-configurable in Settings → AI → Provider.
     """
     llm_cfg = llm_cfg or {}
-    _model = (llm_cfg.get('model') or '').lower()
-    _is_reasoning_model = any(k in _model for k in REASONING_MODEL_KEYWORDS)
-
-    if (llm_cfg.get('provider_kind') not in ('ollama', 'openai_compatible')
-            and not _is_reasoning_model):
+    if not _is_self_hosted_config(llm_cfg) and not _is_reasoning_model(llm_cfg.get('model')):
         return base_max_tokens
     try:
         multiplier = int(llm_cfg.get('local_token_multiplier') or 5)
@@ -603,7 +684,7 @@ def run_setup(watch, datastore, snapshot_text: str) -> None:
     settings = get_llm_settings(datastore)
 
     try:
-        raw, tokens, *_ = llm_client.completion(
+        _resp = tuple(llm_client.completion(
             model=cfg['model'],
             messages=[
                 _cached_system(system_prompt, model=cfg['model']),
@@ -615,9 +696,11 @@ def run_setup(watch, datastore, snapshot_text: str) -> None:
             max_tokens=apply_local_token_multiplier(JSON_RESPONSE_MAX_TOKENS, cfg),
             extra_body=_thinking_extra_body(cfg['model'], settings.thinking_budget),
             debug=settings.debug,
-        )
+        ))
+        raw, tokens, input_tokens, output_tokens = (_resp + (0, 0))[:4]
         _check_token_budget(watch, cfg, tokens)
-        accumulate_global_tokens(datastore, tokens, model=cfg['model'])
+        accumulate_global_tokens(datastore, tokens, input_tokens=input_tokens,
+                                 output_tokens=output_tokens, model=cfg['model'])
         result = parse_setup_response(raw)
         watch['llm_prefilter'] = result['selector']
         logger.debug(f"LLM setup for {watch.get('uuid')}: prefilter={result['selector']} reason={result['reason']}")
@@ -772,7 +855,7 @@ def summarise_change(watch, datastore, diff: str, current_snapshot: str = '') ->
     if not diff.strip():
         return ''
 
-    _check_input_size(diff, _get_max_input_chars(datastore))
+    diff = fit_diff_to_budget(diff, _get_max_input_chars(datastore))
     url = watch.get('url', '')
     title = watch.get('page_title') or watch.get('title') or ''
 
@@ -809,9 +892,9 @@ def summarise_change(watch, datastore, diff: str, current_snapshot: str = '') ->
         input_tokens  = _resp[2] if len(_resp) > 2 else 0
         output_tokens = _resp[3] if len(_resp) > 3 else 0
         summary = raw.strip()
+        # _check_token_budget also bumps llm_tokens_used_cumulative - don't add it twice.
         _check_token_budget(watch, cfg, tokens)
         watch['llm_last_tokens_used'] = tokens
-        watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') or 0) + tokens
         accumulate_global_tokens(datastore, tokens,
                                  input_tokens=input_tokens,
                                  output_tokens=output_tokens,
@@ -821,7 +904,7 @@ def summarise_change(watch, datastore, diff: str, current_snapshot: str = '') ->
             f"summary={summary[:80]}"
         )
         return summary
-    except Exception as e:
+    except Exception:
         raise
 
 
@@ -848,7 +931,8 @@ def preview_extract(watch, datastore, content: str) -> dict | None:
     if not intent or not content.strip():
         return None
 
-    _check_input_size(content, _get_max_input_chars(datastore))
+    # No _check_input_size here: build_preview_prompt only ever sends the first 6,000 chars,
+    # so refusing a large page just broke preview for exactly the pages that need it.
     url = watch.get('url', '')
     title = watch.get('page_title') or watch.get('title') or ''
 
@@ -857,7 +941,7 @@ def preview_extract(watch, datastore, content: str) -> dict | None:
     settings = get_llm_settings(datastore)
 
     try:
-        raw, tokens, *_ = llm_client.completion(
+        _resp = tuple(llm_client.completion(
             model=cfg['model'],
             messages=[
                 _cached_system(system_prompt, model=cfg['model']),
@@ -869,8 +953,10 @@ def preview_extract(watch, datastore, content: str) -> dict | None:
             max_tokens=apply_local_token_multiplier(JSON_RESPONSE_MAX_TOKENS, cfg),
             extra_body=_thinking_extra_body(cfg['model'], settings.thinking_budget),
             debug=settings.debug,
-        )
-        accumulate_global_tokens(datastore, tokens, model=cfg['model'])
+        ))
+        raw, tokens, input_tokens, output_tokens = (_resp + (0, 0))[:4]
+        accumulate_global_tokens(datastore, tokens, input_tokens=input_tokens,
+                                 output_tokens=output_tokens, model=cfg['model'])
         result = parse_preview_response(raw)
         logger.debug(
             f"LLM preview {watch.get('uuid')}: found={result['found']} "
@@ -885,6 +971,13 @@ def preview_extract(watch, datastore, content: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Per-change evaluation
 # ---------------------------------------------------------------------------
+
+EVAL_CACHE_MAX_ENTRIES = 50
+
+
+def compute_eval_cache_key(intent: str, diff: str, model: str = '') -> str:
+    return hashlib.sha256(f"{model}||{intent}||{diff}".encode()).hexdigest()
+
 
 def evaluate_change(watch, datastore, diff: str, current_snapshot: str = '') -> dict | None:
     """
@@ -904,10 +997,11 @@ def evaluate_change(watch, datastore, diff: str, current_snapshot: str = '') -> 
     if not diff or not diff.strip():
         return {'important': False, 'summary': ''}
 
-    _check_input_size(diff, _get_max_input_chars(datastore))
+    diff = fit_diff_to_budget(diff, _get_max_input_chars(datastore))
 
-    # Cache lookup — evaluations are deterministic once cached
-    cache_key = hashlib.sha256(f"{intent}||{diff}".encode()).hexdigest()
+    # Cache lookup — evaluations are deterministic once cached. The model is part of the key
+    # so switching models re-evaluates instead of replaying the old model's verdicts.
+    cache_key = compute_eval_cache_key(intent, diff, cfg.get('model', ''))
     cache = watch.get('llm_evaluation_cache') or {}
     if cache_key in cache:
         logger.debug(f"LLM cache hit for {watch.get('uuid')} key={cache_key[:8]}")
@@ -960,14 +1054,14 @@ def evaluate_change(watch, datastore, diff: str, current_snapshot: str = '') -> 
         raw, tokens = _resp[0], _resp[1]
         input_tokens  = _resp[2] if len(_resp) > 2 else 0
         output_tokens = _resp[3] if len(_resp) > 3 else 0
-        result = parse_eval_response(raw)
     except Exception as e:
         logger.warning(f"LLM evaluation failed for {watch.get('uuid')}: {e}")
         # On failure: don't suppress the notification — pass through as important
         watch['llm_last_tokens_used'] = 0
         return {'important': True, 'summary': ''}
 
-    # Accumulate token usage: per-watch limit and global monthly budget
+    # Accumulate token usage: per-watch limit and global monthly budget. Done before parsing
+    # because an unparseable reply was still billed.
     _check_token_budget(watch, cfg, tokens)
     watch['llm_last_tokens_used'] = tokens
     accumulate_global_tokens(datastore, tokens,
@@ -975,10 +1069,24 @@ def evaluate_change(watch, datastore, diff: str, current_snapshot: str = '') -> 
                              output_tokens=output_tokens,
                              model=cfg['model'])
 
-    # Store in cache
-    if 'llm_evaluation_cache' not in watch or watch['llm_evaluation_cache'] is None:
-        watch['llm_evaluation_cache'] = {}
-    watch['llm_evaluation_cache'][cache_key] = result
+    try:
+        result = parse_eval_response(raw)
+    except ValueError as e:
+        # Empty, truncated or non-JSON reply. Fail open, and do NOT cache it - caching a
+        # non-answer used to suppress this change and every identical one after it for good.
+        logger.warning(
+            f"LLM evaluation for {watch.get('uuid')} returned an unusable reply ({e}) — "
+            f"passing change through as important. Raw reply: {(raw or '')[:200]!r}"
+        )
+        return {'important': True, 'summary': ''}
+
+    # Store in cache, keeping only the newest entries - it lives in the watch's JSON.
+    cache = dict(watch.get('llm_evaluation_cache') or {})
+    cache.pop(cache_key, None)
+    cache[cache_key] = result
+    if len(cache) > EVAL_CACHE_MAX_ENTRIES:
+        cache = dict(list(cache.items())[-EVAL_CACHE_MAX_ENTRIES:])
+    watch['llm_evaluation_cache'] = cache
 
     logger.debug(
         f"LLM eval {watch.get('uuid')} (intent from {source}): "

@@ -468,6 +468,16 @@ def _is_safe_valid_url(test_url):
     return is_safe_valid_url(test_url)
 
 
+@app.template_global('llm_is_configured')
+def _llm_is_configured():
+    # A template global rather than a context var so macros imported without context see it.
+    # Uses the resolved config, so a model set via the LLM_MODEL env var counts too.
+    if datastore is None:
+        return False
+    from changedetectionio.llm.evaluator import get_llm_config
+    return bool(get_llm_config(datastore))
+
+
 @app.template_global('get_html_head_extras')
 def _get_html_head_extras():
     from .pluggy_interface import collect_html_head_extras

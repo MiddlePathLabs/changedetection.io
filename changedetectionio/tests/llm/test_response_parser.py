@@ -164,14 +164,33 @@ class TestParseEvalResponse:
         assert result['important'] is True
         assert result['summary'] == 'Price dropped by $20'
 
-    def test_malformed_json_falls_back_to_safe_default(self):
-        result = parse_eval_response('this is not json at all')
-        assert result['important'] is False
-        assert result['summary'] == ''
+    def test_malformed_json_raises(self):
+        """No silent important=False: the evaluator must see the failure and fail open,
+        otherwise an unusable reply suppresses the change and gets cached."""
+        with pytest.raises(ValueError):
+            parse_eval_response('this is not json at all')
 
-    def test_empty_string_falls_back(self):
-        result = parse_eval_response('')
-        assert result['important'] is False
+    def test_empty_string_raises(self):
+        """Empty content is what a reasoning model returns when max_tokens ran out."""
+        with pytest.raises(ValueError):
+            parse_eval_response('')
+
+    def test_truncated_json_raises(self):
+        with pytest.raises(ValueError):
+            parse_eval_response('{"important": true, "summary": "Price dro')
+
+    def test_object_without_important_key_raises(self):
+        with pytest.raises(ValueError):
+            parse_eval_response('{"summary": "something"}')
+
+    def test_trailing_prose_with_braces_does_not_break_parsing(self):
+        raw = '{"important": true, "summary": "Price fell"}\n\nNote: I compared {old} vs {new}.'
+        result = parse_eval_response(raw)
+        assert result == {'important': True, 'summary': 'Price fell'}
+
+    def test_preamble_with_stray_brace_is_skipped(self):
+        raw = 'Answer { see below:\n{"important": false, "summary": "footer only"}'
+        assert parse_eval_response(raw)['summary'] == 'footer only'
 
     def test_truthy_integer_coerced_to_bool(self):
         raw = '{"important": 1, "summary": "yes"}'

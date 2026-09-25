@@ -9,15 +9,42 @@ LLM and asks it to return a structured JSON answer.
 The module-level `datastore` variable is injected at startup by
 `inject_datastore_into_plugins()` in pluggy_interface.py.
 """
-import json
 import os
 import re
 from loguru import logger
 from changedetectionio.pluggy_interface import hookimpl
 from changedetectionio.llm.evaluator import apply_local_token_multiplier
+from changedetectionio.llm.response_parser import parse_json_object
 
 # Injected at startup by inject_datastore_into_plugins()
 datastore = None
+
+
+def _normalise_price(price) -> float:
+    """Turn an LLM-reported price into a float, handling both 1,299.00 and 1.299,00.
+
+    The old `re.sub(r'[^\\d.]', '', price)` read the European "1.299,00" as 1.299.
+    The right-most of '.' / ',' is taken as the decimal separator; a lone separator
+    followed by exactly three digits ("1,299" / "1.299") is a thousands separator.
+    """
+    if not isinstance(price, str):
+        return float(price)
+    s = re.sub(r'[^\d.,]', '', price)
+    if not s:
+        raise ValueError(f'no digits in price {price!r}')
+    last_dot, last_comma = s.rfind('.'), s.rfind(',')
+    if last_dot >= 0 and last_comma >= 0:
+        dec = '.' if last_dot > last_comma else ','
+        thou = ',' if dec == '.' else '.'
+        s = s.replace(thou, '').replace(dec, '.')
+    elif last_comma >= 0 or last_dot >= 0:
+        sep = ',' if last_comma >= 0 else '.'
+        head, _, tail = s.rpartition(sep)
+        if s.count(sep) > 1 or (len(tail) == 3 and head.strip('0')):
+            s = s.replace(sep, '')
+        else:
+            s = head.replace(sep, '') + '.' + tail
+    return float(s)
 
 SYSTEM_PROMPT = (
     'You are an expert price and restock extraction utility. '
@@ -289,6 +316,7 @@ def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, 
 
     logger.debug(f"LLM System Prompt: {SYSTEM_PROMPT}")
     logger.debug(f"LLM Prompt: {user_prompt}")
+    raw = ''
     try:
         raw, tokens, input_tokens, output_tokens = llm_client.completion(
             model=llm_cfg['model'],
@@ -316,15 +344,11 @@ def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, 
             model=llm_cfg['model'],
         )
 
-        # Strip optional markdown fences the model might add
-        raw = raw.strip()
-        if raw.startswith('```'):
-            raw = re.sub(r'^```[a-z]*\n?', '', raw)
-            raw = raw.rstrip('`').strip()
-
         logger.debug(f"LLM restock fallback raw response: {raw!r}")
 
-        result = json.loads(raw)
+        # Shared parser: copes with markdown fences, <think> scratchpads from reasoning
+        # models and prose around the object, all of which a bare json.loads rejected.
+        result = parse_json_object(raw)
 
         price = result.get('price')
         currency = result.get('currency') or None
@@ -333,10 +357,7 @@ def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, 
         # Normalise price to float
         if price is not None:
             try:
-                if isinstance(price, str):
-                    price = float(re.sub(r'[^\d.]', '', price))
-                else:
-                    price = float(price)
+                price = _normalise_price(price)
             except (ValueError, TypeError):
                 logger.warning(f"LLM restock fallback: could not convert price {price!r} to float, ignoring")
                 price = None
@@ -360,7 +381,7 @@ def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, 
             '_model': llm_cfg['model'],
         }
 
-    except json.JSONDecodeError as e:
+    except ValueError as e:
         logger.warning(f"LLM restock fallback: JSON parse failed ({e}) - raw response was: {raw!r}")
         return None
     except Exception as e:

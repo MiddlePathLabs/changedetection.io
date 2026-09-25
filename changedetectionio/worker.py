@@ -476,22 +476,21 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                     _watch_dates = list(watch.history.keys())
                                     # Capture from_version before new snapshot is added
                                     _llm_from_version = _watch_dates[-1] if _watch_dates else None
+                                    _diff_text = ''
                                     if _watch_dates:
+                                        from changedetectionio.llm.diff_text import build_llm_diff
                                         _prev_text = watch.get_history_snapshot(timestamp=_watch_dates[-1]) or ''
-                                        from difflib import unified_diff as _unified_diff
-                                        _diff_lines = list(_unified_diff(
-                                            _prev_text.splitlines(keepends=True),
-                                            contents.splitlines(keepends=True),
-                                            lineterm='',
-                                            n=3
-                                        ))
-                                        _diff_text = ''.join(_diff_lines) if _diff_lines else contents
-                                    else:
-                                        _diff_text = contents
+                                        _diff_text = build_llm_diff(_prev_text, contents)
+                                    # No line-level difference (e.g. only line endings changed):
+                                    # there is nothing for the model to judge or describe. Sending
+                                    # the whole page as the "diff" (the old fallback) made it
+                                    # report the entire page as new. Leave the change untouched.
+                                    if not _diff_text.strip():
+                                        logger.debug(f"LLM skipped for {uuid}: no line-level diff to evaluate")
 
                                     # Step 1: AI Change Intent — may suppress notification
                                     _llm_intent, _llm_intent_source = resolve_intent(watch, datastore)
-                                    if _llm_intent:
+                                    if _llm_intent and _diff_text.strip():
                                         set_watch_minitext_status(watch, "AI/LLM (rules)..")
                                         _llm_result = await loop.run_in_executor(
                                             executor,
@@ -519,7 +518,8 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                     # that would spend tokens on every change for a summary nobody
                                     # may ever look at.
                                     from changedetectionio.notification_service import watch_will_send_content_changed_notification
-                                    if changed_detected and watch_will_send_content_changed_notification(datastore, watch):
+                                    if (changed_detected and _diff_text.strip()
+                                            and watch_will_send_content_changed_notification(datastore, watch)):
                                         set_watch_minitext_status(watch, "AI/LLM (summary)..")
                                         _change_summary = await loop.run_in_executor(
                                             executor,
@@ -573,7 +573,9 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                     from changedetectionio.llm.evaluator import get_llm_settings as _get_llm_settings_inner
                                     _ls = _get_llm_settings_inner(datastore)
                                     _llm_max_summary_tokens = _ls.max_summary_tokens
-                                    _llm_model = _ls.model
+                                    # The model actually used (LLM_MODEL env var wins over the UI
+                                    # setting) - must match what the diff page puts in its key.
+                                    _llm_model = (_llm_cfg or {}).get('model', '')
                                     _llm_cache_prompt = build_summary_cache_prompt(
                                         effective_prompt=get_effective_summary_prompt(watch, datastore),
                                         max_summary_tokens=_llm_max_summary_tokens,
