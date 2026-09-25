@@ -30,7 +30,7 @@ SCREENSHOT_SIZE_STITCH_THRESHOLD = int(os.getenv("SCREENSHOT_CHUNK_HEIGHT", 1000
 from changedetectionio.content_fetchers.requests import fetcher as html_requests
 
 # Scrapling (browser TLS fingerprint HTTP client) is optional, only offered when it's installed
-from changedetectionio.content_fetchers.scrapling_http import scrapling_is_available
+from changedetectionio.content_fetchers.scrapling_http import scrapling_is_available, scrapling_stealth_is_available
 if scrapling_is_available():
     from changedetectionio.content_fetchers.scrapling_http import fetcher as html_scrapling
 
@@ -196,6 +196,10 @@ else:
     logger.debug("Falling back to selenium as fetcher")
     from .webdriver_selenium import fetcher as html_webdriver
 
+
+# Needs the JS resources above, so imported down here like the browser fetchers
+if scrapling_stealth_is_available():
+    from .scrapling_stealth import fetcher as html_scrapling_stealth
 
 # Register built-in fetchers as plugins after all imports are complete
 from changedetectionio.pluggy_interface import register_builtin_fetchers

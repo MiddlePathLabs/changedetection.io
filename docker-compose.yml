@@ -30,6 +30,21 @@ services:
   #      - PLAYWRIGHT_BYPASS_CSP=false
   #
   #
+  #       Scrapling fetchers (https://github.com/D4Vinci/Scrapling), choose them per watch or as the default "Fetch Method"
+  #       - 'html_scrapling'         HTTP client with a real-browser TLS fingerprint, fast, no browser needed
+  #       - 'html_scrapling_stealth' Hardened Chromium that can get past Cloudflare challenges (runs inside this container)
+  #       Which browser TLS fingerprint 'html_scrapling' presents (chrome, firefox, safari, edge...)
+  #      - SCRAPLING_IMPERSONATE=chrome
+  #       Add real-browser headers and a google.com referer (default true)
+  #      - SCRAPLING_STEALTHY_HEADERS=true
+  #       Try to solve Cloudflare Turnstile/interstitial challenges with the stealth browser (default true)
+  #      - SCRAPLING_SOLVE_CLOUDFLARE=true
+  #       Wait for the network to be idle before extracting with the stealth browser (default false)
+  #      - SCRAPLING_NETWORK_IDLE=false
+  #       Drive an external Chrome over CDP instead of the built-in stealth Chromium (less stealthy)
+  #      - SCRAPLING_CDP_URL=ws://browser-sockpuppet-chrome:3000
+  #
+  #
   #       Alternative WebDriver/selenium URL, do not use "'s or 's! (old, deprecated, does not support screenshots very well, Can't handle custom headers etc)
   #      - WEBDRIVER_URL=http://browser-selenium-chrome:4444/wd/hub
   #
