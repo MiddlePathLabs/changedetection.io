@@ -549,7 +549,7 @@ Math: {{ 1 + 1 }}") }}
                             <td><code>visual_selector_data_ready</code></td>
                             <td>{{ _('Yes') if visual_selector_data_ready else _('No') }}</td>
                         </tr>
-                        {% if not llm_features_disabled and settings_application.get('llm', {}).get('model') %}
+                        {% if llm_is_configured() %}
                         <tr>
                             <td>{{ _('AI tokens (last check)') }}</td>
                             <td>{{ "{:,}".format(watch.get('llm_last_tokens_used') or 0) }}</td>

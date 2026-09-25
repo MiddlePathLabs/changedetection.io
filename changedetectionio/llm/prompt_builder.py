@@ -65,7 +65,7 @@ def build_eval_prompt(
         if excerpt:
             parts.append(f"\nCurrent page state (relevant excerpt):\n{excerpt}")
 
-    parts.append(f"\nWhat changed (diff):\n{diff}")
+    parts.append(f"\nWhat changed (diff):\n{_annotate_moved_lines(diff)}")
 
     return '\n'.join(parts)
 
@@ -78,7 +78,9 @@ def build_eval_system_prompt() -> str:
         "Diff format:\n"
         "- Lines starting with '+' are newly ADDED content\n"
         "- Lines starting with '-' are REMOVED content\n"
-        "- Lines starting with ' ' (space) are unchanged context\n\n"
+        "- Lines starting with ' ' (space) are unchanged context\n"
+        "- Lines starting with '~' were PRE-IDENTIFIED as moved/reordered (the same text is on both "
+        "sides) or as a standalone relative timestamp — not genuinely added or removed\n\n"
         "Respond with ONLY a JSON object — no markdown, no explanation outside it:\n"
         '{"important": true/false, "summary": "one sentence describing the relevant change, or why it doesn\'t match"}\n\n'
         "Rules:\n"

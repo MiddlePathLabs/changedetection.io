@@ -323,15 +323,14 @@ class TestEvaluateChange:
         assert 'Price dropped' in result['summary']
 
     def test_cache_hit_skips_llm_call(self):
-        from changedetectionio.llm.evaluator import evaluate_change
-        import hashlib
+        from changedetectionio.llm.evaluator import evaluate_change, compute_eval_cache_key
 
         ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini', 'api_key': 'sk-test'})
         watch = _make_watch(llm_intent='flag price drops')
 
         diff = '- $500\n+ $400'
         intent = 'flag price drops'
-        cache_key = hashlib.sha256(f"{intent}||{diff}".encode()).hexdigest()
+        cache_key = compute_eval_cache_key(intent, diff, 'gpt-4o-mini')
         watch['llm_evaluation_cache'] = {
             cache_key: {'important': True, 'summary': 'cached result'}
         }
@@ -399,6 +398,108 @@ class TestEvaluateChange:
             evaluate_change(watch, ds, diff='- $400\n+ $350')
 
         assert watch.get('llm_tokens_used_cumulative') == 140
+
+    def test_unusable_reply_fails_open_and_is_not_cached(self):
+        """An empty/garbled reply (e.g. a reasoning model out of max_tokens) used to become
+        important=False AND get cached, silently dropping this change for good."""
+        from changedetectionio.llm.evaluator import evaluate_change
+
+        ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini'})
+        watch = _make_watch(llm_intent='flag price drops')
+
+        with patch('changedetectionio.llm.client.completion', return_value=('', 400)):
+            result = evaluate_change(watch, ds, diff='- $500\n+ $400')
+
+        assert result['important'] is True
+        assert watch['llm_evaluation_cache'] == {}
+        # The call was still billed, so it still counts.
+        assert watch.get('llm_last_tokens_used') == 400
+
+        # A later good reply for the same diff is evaluated, not served from a bad cache.
+        good = '{"important": false, "summary": "no drop"}'
+        with patch('changedetectionio.llm.client.completion', return_value=(good, 50)) as m:
+            result = evaluate_change(watch, ds, diff='- $500\n+ $400')
+            m.assert_called_once()
+        assert result['important'] is False
+
+    def test_switching_model_is_a_cache_miss(self):
+        from changedetectionio.llm.evaluator import evaluate_change
+
+        ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini'})
+        watch = _make_watch(llm_intent='flag price drops')
+        resp = '{"important": true, "summary": "x"}'
+        with patch('changedetectionio.llm.client.completion', return_value=(resp, 10)):
+            evaluate_change(watch, ds, diff='- $500\n+ $400')
+
+        ds.data['settings']['application']['llm']['model'] = 'gpt-4.1'
+        with patch('changedetectionio.llm.client.completion', return_value=(resp, 10)) as m:
+            evaluate_change(watch, ds, diff='- $500\n+ $400')
+            m.assert_called_once()
+
+    def test_cache_is_bounded(self):
+        from changedetectionio.llm.evaluator import evaluate_change, EVAL_CACHE_MAX_ENTRIES
+
+        ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini'})
+        watch = _make_watch(llm_intent='flag price drops')
+        resp = '{"important": true, "summary": "x"}'
+        with patch('changedetectionio.llm.client.completion', return_value=(resp, 1)):
+            for i in range(EVAL_CACHE_MAX_ENTRIES + 10):
+                evaluate_change(watch, ds, diff=f'- ${i}\n+ ${i + 1}')
+        assert len(watch['llm_evaluation_cache']) == EVAL_CACHE_MAX_ENTRIES
+
+    def test_oversized_diff_is_trimmed_not_refused(self):
+        """Big rewrites used to raise LLMInputTooLargeError and skip intent filtering."""
+        from changedetectionio.llm.evaluator import evaluate_change
+
+        ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini', 'max_input_chars': 500})
+        watch = _make_watch(llm_intent='flag price drops')
+        diff = '\n'.join([' unchanged context line'] * 100 + ['- $500', '+ $400'])
+        resp = '{"important": true, "summary": "dropped"}'
+        with patch('changedetectionio.llm.client.completion', return_value=(resp, 10)) as m:
+            result = evaluate_change(watch, ds, diff=diff)
+        assert result['important'] is True
+        sent = m.call_args.kwargs['messages'][1]['content']
+        assert '+ $400' in sent and 'unchanged context line' not in sent
+
+
+class TestFitDiffToBudget:
+    def test_small_diff_untouched(self):
+        from changedetectionio.llm.evaluator import fit_diff_to_budget
+        assert fit_diff_to_budget(' a\n-b\n+c', 100) == ' a\n-b\n+c'
+
+    def test_drops_context_first(self):
+        from changedetectionio.llm.evaluator import fit_diff_to_budget
+        diff = '\n'.join([' ctx'] * 50 + ['-old', '+new'])
+        assert fit_diff_to_budget(diff, 50) == '-old\n+new'
+
+    def test_truncates_and_marks_when_changes_alone_are_too_big(self):
+        from changedetectionio.llm.evaluator import fit_diff_to_budget
+        diff = '\n'.join(f'+line {i}' for i in range(200))
+        out = fit_diff_to_budget(diff, 300)
+        assert len(out) <= 300
+        assert out.endswith('truncated to fit the AI input limit ...]')
+
+
+class TestReasoningDetection:
+    def test_known_reasoning_families(self):
+        from changedetectionio.llm.evaluator import _is_reasoning_model
+        for m in ('openrouter/deepseek/deepseek-r1', 'deepseek/deepseek-reasoner',
+                  'gemini/gemini-2.5-pro', 'groq/qwen/qwen3-32b', 'gpt-5-mini'):
+            assert _is_reasoning_model(m), m
+
+    def test_non_reasoning_and_opt_in_only(self):
+        from changedetectionio.llm.evaluator import _is_reasoning_model
+        for m in ('gpt-4o-mini', 'claude-sonnet-4-5', 'anthropic/claude-opus-4', 'gemini/gemini-2.0-flash', ''):
+            assert not _is_reasoning_model(m), m
+
+    def test_env_configured_ollama_gets_headroom(self):
+        """provider_kind only exists for UI-configured providers; LLM_MODEL=ollama/... has none."""
+        from changedetectionio.llm.evaluator import apply_local_token_multiplier
+        assert apply_local_token_multiplier(400, {'model': 'ollama/llama3.2', 'api_key': '', 'api_base': ''}) == 2000
+
+    def test_gemini_pro_gets_no_zero_thinking_budget(self):
+        from changedetectionio.llm.evaluator import _thinking_extra_body
+        assert _thinking_extra_body('gemini/gemini-2.5-pro', 0) is None
 
 
 # ---------------------------------------------------------------------------

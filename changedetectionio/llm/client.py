@@ -4,8 +4,10 @@ Keeps litellm import isolated so the rest of the codebase doesn't depend on it d
 and makes the call easy to mock in tests.
 """
 
+import copy
 import logging
 import os
+import time
 
 from loguru import logger
 
@@ -38,6 +40,45 @@ DEFAULT_LOCAL_TIMEOUT = int(os.getenv('LLM_LOCAL_TIMEOUT', 1800))
 _NO_TEMPERATURE_MODEL_KEYWORDS = ('flash-lite', 'thinking-exp', 'o1', 'o3', 'o4', 'gpt-5')
 
 DEFAULT_RETRIES = 3
+
+# Backoff between retries of transient failures (connection reset, 429, 5xx/overloaded).
+# Exponential from _RETRY_BACKOFF_BASE, capped; a provider's Retry-After wins when present.
+_RETRY_BACKOFF_BASE = 2.0
+_RETRY_BACKOFF_MAX = 30.0
+
+# When a reply comes back empty with finish_reason='length' the model spent its whole output
+# budget reasoning and never reached the answer. Retry once with this much more headroom
+# (capped) instead of handing the caller an empty string.
+_EMPTY_LENGTH_RETRY_MULTIPLIER = 4
+_EMPTY_LENGTH_RETRY_MAX_TOKENS = 32_000
+
+
+def max_call_duration(timeout: int) -> int:
+    """Worst-case wall time of one completion() call, for UI deadlines.
+
+    Timeouts are not retried, but a request can still time out after transient-error retries
+    and after the one empty-reply retry, so allow for the slowest realistic path: two full
+    timeouts plus every backoff sleep.
+    """
+    backoff = sum(min(_RETRY_BACKOFF_BASE ** n, _RETRY_BACKOFF_MAX) for n in range(1, DEFAULT_RETRIES))
+    return int(timeout * 2 + backoff)
+
+
+def _retry_after_seconds(exc) -> float | None:
+    """Retry-After (seconds) from a provider error's response headers, if it sent one."""
+    try:
+        headers = getattr(getattr(exc, 'response', None), 'headers', None) or {}
+        value = headers.get('retry-after') or headers.get('Retry-After')
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _backoff(attempt: int, exc=None) -> float:
+    after = _retry_after_seconds(exc)
+    if after is not None and after >= 0:
+        return min(after, _RETRY_BACKOFF_MAX * 2)
+    return min(_RETRY_BACKOFF_BASE ** attempt, _RETRY_BACKOFF_MAX)
 
 
 class _LoguruInterceptHandler(logging.Handler):
@@ -88,7 +129,10 @@ def completion(  # noqa: C901
 ) -> tuple[str, int, int, int]:
     """
     Call the LLM and return (response_text, total_tokens, input_tokens, output_tokens).
-    Retries up to DEFAULT_RETRIES times on timeout or connection errors.
+    Retries up to DEFAULT_RETRIES times (with backoff) on connection errors, rate limits
+    and provider 5xx/overloaded errors. A timeout is NOT retried: a model too slow to answer
+    within the deadline is just as slow the second time, and retrying multiplied the wait.
+    An empty reply cut off by max_tokens (reasoning models) is retried once with more room.
     Token counts are 0 if the provider doesn't return usage data.
     Raises on network/auth errors — callers handle gracefully.
 
@@ -120,9 +164,21 @@ def completion(  # noqa: C901
     if api_base:
         kwargs['api_base'] = api_base
     if extra_body:
-        kwargs['extra_body'] = extra_body
+        # Copied: the 400-retry path below strips keys out of it in place.
+        kwargs['extra_body'] = copy.deepcopy(extra_body)
 
-    _retryable = (litellm.Timeout, litellm.APIConnectionError)
+    _retryable = tuple(
+        cls for cls in (
+            getattr(litellm, 'APIConnectionError', None),
+            getattr(litellm, 'RateLimitError', None),
+            getattr(litellm, 'InternalServerError', None),
+            getattr(litellm, 'ServiceUnavailableError', None),
+        ) if isinstance(cls, type)
+    )
+    _timeout_exc = getattr(litellm, 'Timeout', None)
+    _context_exc = getattr(litellm, 'ContextWindowExceededError', None)
+    _expanded_for_empty = False
+    _accum_total = _accum_in = _accum_out = 0
 
     # Some models reject sampling params outright: Anthropic Claude Opus 4.7/4.8 and
     # Fable return HTTP 400 for 'temperature', and OpenAI reasoning models (o1/o3/gpt-5)
@@ -159,10 +215,41 @@ def completion(  # noqa: C901
                         f"LLM client: extracted text from message.parts ({len(parts)} parts) model={model!r}"
                     )
 
+            usage = getattr(response, 'usage', None)
+            input_tokens = int(getattr(usage, 'prompt_tokens', 0) or 0) if usage else 0
+            output_tokens = int(getattr(usage, 'completion_tokens', 0) or 0) if usage else 0
+            total_tokens = (
+                int(getattr(usage, 'total_tokens', 0) or 0)
+                if usage
+                else (input_tokens + output_tokens)
+            )
+            # Include tokens billed by an earlier empty/truncated attempt so budgets stay honest.
+            _accum_total += total_tokens
+            _accum_in += input_tokens
+            _accum_out += output_tokens
+
+            if not text and finish == 'length' and not _expanded_for_empty:
+                # The model reasoned until it hit max_tokens and never produced an answer.
+                # Handing back '' makes every caller fall through to a default, so give it
+                # one more go with real headroom.
+                _expanded_for_empty = True
+                _old = kwargs['max_tokens']
+                kwargs['max_tokens'] = min(
+                    max(_old * _EMPTY_LENGTH_RETRY_MULTIPLIER, _old + 2000),
+                    _EMPTY_LENGTH_RETRY_MAX_TOKENS,
+                )
+                attempt -= 1
+                logger.warning(
+                    f"LLM client: empty reply with finish_reason='length' model={model!r} "
+                    f"(likely reasoning used the whole budget) — retrying once with "
+                    f"max_tokens {_old} -> {kwargs['max_tokens']}"
+                )
+                continue
+
             if finish == 'length':
                 logger.warning(
                     f"LLM client: response truncated (finish_reason='length') model={model!r} "
-                    f"— increase max_tokens; got {len(text)} chars so far"
+                    f"max_tokens={kwargs['max_tokens']} — got {len(text)} chars"
                 )
 
             if not text:
@@ -172,43 +259,53 @@ def completion(  # noqa: C901
                     f"message={message!r}"
                 )
 
-            usage = getattr(response, 'usage', None)
-            input_tokens = int(getattr(usage, 'prompt_tokens', 0) or 0) if usage else 0
-            output_tokens = int(getattr(usage, 'completion_tokens', 0) or 0) if usage else 0
-            total_tokens = (
-                int(getattr(usage, 'total_tokens', 0) or 0)
-                if usage
-                else (input_tokens + output_tokens)
-            )
             logger.debug(
                 f"LLM client: model={model!r} finish={finish!r} "
-                f"tokens={total_tokens} (in={input_tokens} out={output_tokens}) "
+                f"tokens={_accum_total} (in={_accum_in} out={_accum_out}) "
                 f"text_len={len(text)}"
             )
-            return text, total_tokens, input_tokens, output_tokens
+            return text, _accum_total, _accum_in, _accum_out
 
-        except _retryable as e:
-            # litellm formats its Timeout message with None when the provider doesn't
-            # propagate the timeout value — patch the exception args in-place so every
-            # caller that logs str(e) sees the real number.
-            _fix = f'after {_timeout} seconds'
-            try:
-                e.args = tuple(str(a).replace('after None seconds', _fix) for a in e.args)
-            except Exception:
-                pass
-            if attempt < DEFAULT_RETRIES:
+        except Exception as e:
+            if _timeout_exc is not None and isinstance(e, _timeout_exc):
+                # litellm formats its Timeout message with None when the provider doesn't
+                # propagate the timeout value — patch the exception args in-place so every
+                # caller that logs str(e) sees the real number.
+                _fix = f'after {_timeout} seconds'
+                try:
+                    e.args = tuple(str(a).replace('after None seconds', _fix) for a in e.args)
+                    # litellm's __str__ reads .message, not .args
+                    if isinstance(getattr(e, 'message', None), str):
+                        e.message = e.message.replace('after None seconds', _fix)
+                except Exception:
+                    pass
+                logger.warning(f"LLM call timed out after {_timeout}s model={model!r} error={e}")
+                raise
+
+            if _retryable and isinstance(e, _retryable):
+                if attempt < DEFAULT_RETRIES:
+                    _sleep = _backoff(attempt, e)
+                    logger.warning(
+                        f"LLM call transient error {type(e).__name__} (attempt {attempt}/{DEFAULT_RETRIES}), "
+                        f"retrying in {_sleep:.0f}s — model={model!r} error={e}"
+                    )
+                    time.sleep(_sleep)
+                    continue
                 logger.warning(
-                    f"LLM call timed out/connection error (attempt {attempt}/{DEFAULT_RETRIES}), "
-                    f"retrying — model={model!r} timeout={_timeout}s error={e}"
+                    f"LLM call failed after {DEFAULT_RETRIES} attempts "
+                    f"model={model!r} error={e}"
                 )
-                continue
-            logger.warning(
-                f"LLM call failed after {DEFAULT_RETRIES} attempts ({_timeout}s timeout) "
-                f"model={model!r} error={e}"
-            )
-            raise
+                raise
 
-        except litellm.BadRequestError as e:
+            if not isinstance(e, litellm.BadRequestError):
+                logger.warning(f"LLM call failed: model={model!r} error={e}")
+                raise
+
+            if _context_exc is not None and isinstance(e, _context_exc):
+                # Stripping temperature can't make an oversized prompt fit.
+                logger.warning(f"LLM call failed: prompt exceeds context window model={model!r} error={e}")
+                raise
+
             # If the provider rejected an unsupported sampling param or extra_body
             # (e.g. Gemini INVALID_ARGUMENT on thinkingConfig or temperature), drop
             # them and retry once.
@@ -240,9 +337,5 @@ def completion(  # noqa: C901
                         f"stripped {dropped} and retrying once"
                     )
                     continue
-            logger.warning(f"LLM call failed: model={model!r} error={e}")
-            raise
-
-        except Exception as e:
             logger.warning(f"LLM call failed: model={model!r} error={e}")
             raise

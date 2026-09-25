@@ -194,9 +194,10 @@ def construct_blueprint(datastore: ChangeDetectionStore):
         on the diff text, only on the version pair, the effective prompt, the diff prefs and the
         model - so a poll never has to re-run difflib over two snapshots.
         """
+        from changedetectionio.llm.client import max_call_duration
         from changedetectionio.llm.evaluator import (
-            DiffPrefs, build_summary_cache_prompt, get_effective_summary_prompt, get_llm_settings,
-            resolve_llm_timeout,
+            DiffPrefs, _runtime_llm_config, build_summary_cache_prompt, get_effective_summary_prompt,
+            get_llm_config, get_llm_settings, resolve_llm_timeout,
         )
 
         try:
@@ -204,9 +205,12 @@ def construct_blueprint(datastore: ChangeDetectionStore):
         except KeyError:
             return None, ({'summary': None, 'error': 'Watch not found', 'status': 'error'}, 404)
 
-        llm_cfg = datastore.data.get('settings', {}).get('application', {}).get('llm', {})
-        if not llm_cfg.get('model'):
-            return None, ({'summary': None, 'error': 'LLM not configured', 'status': 'error'}, 400)
+        # Resolved config, so a model set via the LLM_MODEL env var counts as configured.
+        llm_cfg = _runtime_llm_config(datastore)
+        if not llm_cfg:
+            error = 'AI / LLM is switched off in settings' if get_llm_config(datastore) else 'LLM not configured'
+            return None, ({'summary': None, 'error': error, 'status': 'error'}, 400)
+        stored_llm = datastore.data.get('settings', {}).get('application', {}).get('llm') or {}
 
         dates = list(watch.history.keys())
         if len(dates) < 2:
@@ -215,7 +219,7 @@ def construct_blueprint(datastore: ChangeDetectionStore):
         # Default baseline for the watchlist "Summary" link (when no explicit from_version
         # is requested) is configurable at Settings > AI. Default 'second_last_version'
         # compares the previous snapshot; 'since_last_viewed' uses the operator's last view.
-        if llm_cfg.get('watchlist_overview_summary', 'second_last_version') == 'since_last_viewed':
+        if stored_llm.get('watchlist_overview_summary', 'second_last_version') == 'since_last_viewed':
             best_from = watch.get_from_version_based_on_last_viewed
             default_from = best_from if best_from else dates[-2]
         else:
@@ -232,7 +236,7 @@ def construct_blueprint(datastore: ChangeDetectionStore):
             effective_prompt=get_effective_summary_prompt(watch, datastore),
             max_summary_tokens=settings.max_summary_tokens,
             prefs=prefs,
-            model=settings.model,
+            model=llm_cfg.get('model', ''),
         )
 
         return {
@@ -250,26 +254,21 @@ def construct_blueprint(datastore: ChangeDetectionStore):
             # browser must not give up before this, or it reports a failure for a job that is
             # still running and will still write its summary - a local Ollama/vLLM endpoint
             # gets 1800s here against the client's old fixed 180s. See _pending_reply().
-            'llm_timeout': resolve_llm_timeout(llm_cfg),
+            # Worst case of one client call (transient-error retries, the empty-reply retry),
+            # not just one timeout - otherwise the browser gives up on a job still running.
+            'llm_timeout': max_call_duration(resolve_llm_timeout(llm_cfg)),
         }, None
 
     def _build_summary_diff(ctx):
         """Build the diff text to summarise. The expensive half - POST only."""
-        import difflib
+        from changedetectionio.llm.diff_text import build_llm_diff
 
         watch = ctx['watch']
         prefs = ctx['prefs']
         from_version, to_version = ctx['from_version'], ctx['to_version']
 
-        def _prep(text):
-            """Optionally normalise whitespace on each line before diffing."""
-            if not prefs.ignore_whitespace:
-                return text.splitlines()
-            return [' '.join(line.split()) for line in text.splitlines()]
-
         def _make_unified_diff(a_text, b_text):
-            lines = list(difflib.unified_diff(_prep(a_text), _prep(b_text), lineterm='', n=3))
-            return '\n'.join(lines[2:]) if len(lines) > 2 else '\n'.join(lines)
+            return build_llm_diff(a_text, b_text, ignore_whitespace=prefs.ignore_whitespace)
 
         def _apply_filters(diff_text):
             """Strip +/- lines the user has hidden in the UI so the LLM matches what they see."""
@@ -479,7 +478,6 @@ def construct_blueprint(datastore: ChangeDetectionStore):
             # refused ours, so nothing was sent to the LLM twice.
             logger.info(f"AI summary for {uuid} was already started by a concurrent request, "
                         f"returning pending")
-        summary_jobs.submit(job_key, _job, on_settled=_announce)
         _mark_viewed(uuid)
         return jsonify(_pending_reply(ctx)), 202
 

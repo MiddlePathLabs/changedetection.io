@@ -182,9 +182,9 @@ def render(watch, datastore, request, url_for, render_template, flash, redirect,
 
     note = diff_versions.note
 
-    llm_configured = bool(
-        datastore.data.get('settings', {}).get('application', {}).get('llm', {}).get('model')
-    )
+    # Resolved config, so a model set via the LLM_MODEL env var counts as configured.
+    from changedetectionio.llm.evaluator import get_llm_config
+    llm_configured = bool(get_llm_config(datastore))
 
     # Load cached AI diff summary for this exact from→to + prompt combination
     viewing_latest = diff_versions.viewing_latest
@@ -202,7 +202,7 @@ def render(watch, datastore, request, url_for, render_template, flash, redirect,
             from changedetectionio.llm.evaluator import get_llm_settings
             _ls = get_llm_settings(datastore)
             _max_summary_tokens = _ls.max_summary_tokens
-            _llm_model = _ls.model
+            _llm_model = (get_llm_config(datastore) or {}).get('model', '')
             _cache_prompt = build_summary_cache_prompt(
                 effective_prompt=_prompt,
                 max_summary_tokens=_max_summary_tokens,
