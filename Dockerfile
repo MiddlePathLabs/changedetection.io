@@ -58,7 +58,8 @@ RUN --mount=type=cache,id=pip,sharing=locked,target=/tmp/pip-cache \
 # Scrapling - 'html_scrapling' fetcher, HTTP client with a real-browser TLS fingerprint (curl_cffi)
 # Only the HTTP side is used, so not scrapling[fetchers] (that needs a newer playwright than the one above),
 # but Scrapling still imports playwright + patchright at module level, so patchright is needed here.
-# No browsers are downloaded. Not available on arm/v6 and arm/v7 (no curl_cffi/patchright wheels).
+# The stealth fetcher's browser is installed in the final stage (INSTALL_SCRAPLING_BROWSER).
+# Not available on arm/v6 and arm/v7 (no curl_cffi/patchright wheels).
 RUN --mount=type=cache,id=pip,sharing=locked,target=/tmp/pip-cache \
   pip install \
   --prefer-binary \
@@ -68,6 +69,9 @@ RUN --mount=type=cache,id=pip,sharing=locked,target=/tmp/pip-cache \
   "curl_cffi>=0.16.1" \
   "browserforge>=1.2.4" \
   "apify-fingerprint-datapoints>=0.15.0" \
+  "msgspec>=0.21.1" \
+  "anyio>=4.14.0" \
+  "protego>=0.6.2" \
   patchright \
   || echo "WARN: Failed to install Scrapling. The application can still run, but the Scrapling option will be disabled."
 
@@ -169,6 +173,17 @@ COPY docs/api-spec.yaml /app/docs/api-spec.yaml
 
 # Starting wrapper
 COPY changedetection.py /app/changedetection.py
+
+# Chromium (+ its system libraries) for the 'html_scrapling_stealth' fetcher, adds ~600MB to the image.
+# Scrapling launches the full Chromium (new headless mode), so the separate headless shell is not needed.
+# Build with --build-arg INSTALL_SCRAPLING_BROWSER=false to skip it, the stealth fetcher can then still
+# drive an external Chrome via SCRAPLING_CDP_URL.
+ARG INSTALL_SCRAPLING_BROWSER=true
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN if [ "$INSTALL_SCRAPLING_BROWSER" = "true" ] && python -c "import patchright" 2>/dev/null; then \
+      (python -m patchright install --with-deps --no-shell chromium && rm -rf /var/lib/apt/lists/*) \
+      || echo "WARN: Failed to install the Scrapling stealth browser, set SCRAPLING_CDP_URL to use an external one."; \
+    fi
 
 # Github Action test purpose(test-only.yml).
 # On production, it is effectively LOGGER_LEVEL=''.

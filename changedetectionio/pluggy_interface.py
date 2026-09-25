@@ -317,6 +317,9 @@ def register_builtin_fetchers():
     from changedetectionio.content_fetchers import scrapling_http
     if scrapling_http.scrapling_is_available():
         plugin_manager.register(scrapling_http.scrapling_http_plugin, 'builtin_scrapling_http')
+    if scrapling_http.scrapling_stealth_is_available():
+        from changedetectionio.content_fetchers import scrapling_stealth
+        plugin_manager.register(scrapling_stealth.scrapling_stealth_plugin, 'builtin_scrapling_stealth')
 
 
 def register_builtin_restock_plugins():

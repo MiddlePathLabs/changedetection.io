@@ -24,6 +24,24 @@ def scrapling_is_available():
     return all(find_spec(m) for m in ('scrapling', 'curl_cffi', 'browserforge', 'playwright', 'patchright'))
 
 
+def scrapling_stealth_is_available():
+    """The stealth browser side of Scrapling needs a few more of its [fetchers] extras"""
+    from importlib.util import find_spec
+    return scrapling_is_available() and all(find_spec(m) for m in ('msgspec', 'anyio', 'protego'))
+
+
+def decode_body(raw_content, content_type, url=None):
+    """Bytes -> str using the Content-Type charset, or sniffing when there is none"""
+    charset_match = CHARSET_RE.search(content_type or '')
+    encoding = charset_match.group(1) if charset_match else sniff_encoding(content=raw_content, content_type=content_type, url=url)
+    try:
+        codecs.lookup(encoding or 'utf-8')
+    except LookupError:
+        logger.warning(f"URL: {url} Unknown encoding '{encoding}', falling back to utf-8")
+        encoding = 'utf-8'
+    return raw_content.decode(encoding or 'utf-8', errors='replace')
+
+
 # Uses https://github.com/D4Vinci/Scrapling (curl_cffi underneath) - the TLS/HTTP2 fingerprint and headers
 # look like a real browser, which gets past a lot of the basic anti-bot checks that block `requests`,
 # without the cost of running a browser. Subclasses the requests fetcher for __init__/quit() behaviour.
@@ -136,15 +154,7 @@ class fetcher(requests_fetcher):
 
         text = ''
         if not is_binary and raw_content:
-            content_type = self.headers.get('content-type', '')
-            charset_match = CHARSET_RE.search(content_type)
-            encoding = charset_match.group(1) if charset_match else sniff_encoding(content=raw_content, content_type=content_type, url=url)
-            try:
-                codecs.lookup(encoding or 'utf-8')
-            except LookupError:
-                logger.warning(f"URL: {url} Unknown encoding '{encoding}', falling back to utf-8")
-                encoding = 'utf-8'
-            text = raw_content.decode(encoding or 'utf-8', errors='replace')
+            text = decode_body(raw_content, content_type=self.headers.get('content-type', ''), url=url)
 
         if not raw_content:
             logger.debug(f"Scrapling returned empty content for '{url}'")
