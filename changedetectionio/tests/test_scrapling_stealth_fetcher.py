@@ -79,6 +79,35 @@ def test_scrapling_stealth_headers_and_js(client, live_server, measure_memory_us
     delete_all_watches(client)
 
 
+def test_scrapling_stealth_navigation_guard(client, live_server, measure_memory_usage, datastore_path, monkeypatch):
+    """Navigations to private/reserved addresses are blocked, but only the main page doing it is an error.
+    iframes (ads etc) that a DNS ad-blocker resolves to 0.0.0.0 must not fail the whole check."""
+    import asyncio
+    from changedetectionio.content_fetchers import scrapling_stealth
+
+    # The test server is on localhost which is always "private", so pretend only the marked URLs are
+    monkeypatch.setenv('ALLOW_IANA_RESTRICTED_ADDRESSES', 'false')
+    monkeypatch.setattr(scrapling_stealth, 'is_fetch_url_allowed', lambda u: (True, ''))
+    from urllib.parse import urlparse
+    monkeypatch.setattr(scrapling_stealth, 'is_url_private_or_parser_confused', lambda u: urlparse(u).path == '/test-endpoint2')
+
+    private_url = url_for('test_endpoint2', _external=True)
+
+    def run(html):
+        f = scrapling_stealth.fetcher()
+        asyncio.run(f.run(url=url_for('test_endpoint', content=html, _external=True), request_headers={}, timeout=30))
+        return f
+
+    # iframe to a "private" address - dropped, page still fetched fine
+    f = run(f'<html><body><p>main-page-content</p><iframe src="{private_url}"></iframe></body></html>')
+    assert f.status_code == 200
+    assert 'main-page-content' in f.content
+
+    # The main page navigating to a "private" address is still refused
+    with pytest.raises(Exception, match="Redirect blocked"):
+        run(f'<html><body>redirecting<script>location.href="{private_url}"</script></body></html>')
+
+
 def test_scrapling_stealth_http_error(client, live_server, measure_memory_usage, datastore_path):
     with open(os.path.join(datastore_path, "endpoint-content.txt"), "w") as f:
         f.write("Now you going to get a 404 error code\n")
