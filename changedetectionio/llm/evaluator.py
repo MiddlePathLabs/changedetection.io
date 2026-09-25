@@ -2,7 +2,6 @@
 LLM evaluation orchestration.
 
 Two public entry points:
-  - run_setup(watch, datastore)        — one-time: decide if pre-filter needed
   - evaluate_change(watch, datastore, diff, current_snapshot) — per-change evaluation
 
 Intent resolution: watch.llm_intent → first tag with llm_intent whose AI switch is "on"
@@ -33,9 +32,8 @@ from .prompt_builder import (
     build_change_summary_prompt, build_change_summary_system_prompt,
     build_eval_prompt, build_eval_system_prompt,
     build_preview_prompt, build_preview_system_prompt,
-    build_setup_prompt, build_setup_system_prompt,
 )
-from .response_parser import parse_eval_response, parse_preview_response, parse_setup_response
+from .response_parser import parse_eval_response, parse_preview_response
 
 from changedetectionio.model.LLMSettings import (
     LLMSettings,
@@ -617,7 +615,7 @@ def is_global_token_budget_exceeded(datastore) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# One-time setup: derive pre-filter
+# Per-watch token budget
 # ---------------------------------------------------------------------------
 
 def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
@@ -662,51 +660,6 @@ def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
                 return False
 
     return True
-
-
-def run_setup(watch, datastore, snapshot_text: str) -> None:
-    """
-    Ask the LLM whether a CSS pre-filter would improve precision for this intent.
-    Stores result in watch['llm_prefilter'] (str selector or None).
-    Called once when intent is first set, and again if pre-filter returns zero matches.
-    """
-    cfg = _runtime_llm_config(datastore)
-    if not cfg:
-        return
-
-    intent, _ = resolve_intent(watch, datastore)
-    if not intent:
-        return
-
-    url = watch.get('url', '')
-    system_prompt = build_setup_system_prompt()
-    user_prompt = build_setup_prompt(intent, snapshot_text, url=url)
-    settings = get_llm_settings(datastore)
-
-    try:
-        _resp = tuple(llm_client.completion(
-            model=cfg['model'],
-            messages=[
-                _cached_system(system_prompt, model=cfg['model']),
-                {'role': 'user', 'content': user_prompt},
-            ],
-            api_key=cfg.get('api_key'),
-            api_base=cfg.get('api_base'),
-            timeout=resolve_llm_timeout(cfg),
-            max_tokens=apply_local_token_multiplier(JSON_RESPONSE_MAX_TOKENS, cfg),
-            extra_body=_thinking_extra_body(cfg['model'], settings.thinking_budget),
-            debug=settings.debug,
-        ))
-        raw, tokens, input_tokens, output_tokens = (_resp + (0, 0))[:4]
-        _check_token_budget(watch, cfg, tokens)
-        accumulate_global_tokens(datastore, tokens, input_tokens=input_tokens,
-                                 output_tokens=output_tokens, model=cfg['model'])
-        result = parse_setup_response(raw)
-        watch['llm_prefilter'] = result['selector']
-        logger.debug(f"LLM setup for {watch.get('uuid')}: prefilter={result['selector']} reason={result['reason']}")
-    except Exception as e:
-        logger.warning(f"LLM setup call failed for {watch.get('uuid')}: {e}")
-        watch['llm_prefilter'] = None
 
 
 # ---------------------------------------------------------------------------

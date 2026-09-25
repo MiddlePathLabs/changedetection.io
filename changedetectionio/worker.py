@@ -258,6 +258,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         e.xpath_data = None  # Free memory immediately
                     if e.page_text:
                         watch.save_error_text(contents=e.page_text)
+                    _save_error_html(watch, uuid, update_handler)
 
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
                     process_changedetection_results = False
@@ -269,6 +270,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
                     err_text = "Warning, no filters were found, no change detection ran - Did the page change layout? update your Visual Filter if necessary."
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
+                    _save_error_html(watch, uuid, update_handler)
 
                     # Filter wasnt found, but we should still update the visual selector so that they can have a chance to set it up again
                     if e.screenshot:
@@ -779,9 +781,22 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
     return "shutdown"
 
 
+def _save_error_html(watch, uuid, update_handler):
+    """Keep the HTML of a failed fetch for the AI "diagnose" helper. Never breaks the worker."""
+    try:
+        # Only the handler built for *this* watch - update_handler survives loop iterations.
+        if update_handler is None or getattr(update_handler, 'watch_uuid', None) != uuid:
+            return
+        content = getattr(getattr(update_handler, 'fetcher', None), 'content', None)
+        if content:
+            watch.save_error_html(content)
+    except Exception as e:
+        logger.debug(f"Could not save error HTML for {uuid}: {e}")
+
+
 def cleanup_error_artifacts(uuid, datastore):
     """Helper function to clean up error artifacts"""
-    cleanup_files = ["last-error-screenshot.png", "last-error.txt"]
+    cleanup_files = ["last-error-screenshot.png", "last-error.txt", "last-error.html.br"]
     for f in cleanup_files:
         full_path = os.path.join(datastore.datastore_path, uuid, f)
         if os.path.isfile(full_path):

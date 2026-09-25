@@ -1227,6 +1227,31 @@ class model(EntityPersistenceMixin, watch_base):
         with open(target_path, 'w', encoding='utf-8') as f:
             f.write(contents)
 
+    # Raw HTML of the last fetch that failed (e.g. the include filter no longer matched), so the
+    # AI "diagnose" helper can look at the page as it is now rather than at the last snapshot
+    # that happened to succeed. Removed with the other error artifacts once a check succeeds.
+    ERROR_HTML_MAX_BYTES = 2 * 1024 * 1024
+
+    def save_error_html(self, contents):
+        import brotli
+        if not contents:
+            return
+        if isinstance(contents, bytes):
+            contents = contents.decode('utf-8', errors='replace')
+        contents = contents[:self.ERROR_HTML_MAX_BYTES]
+        self.ensure_data_dir_exists()
+        target_path = os.path.join(self.data_dir, "last-error.html.br")
+        with open(target_path, 'wb') as f:
+            f.write(brotli.compress(contents.encode('utf-8'), mode=brotli.MODE_TEXT))
+
+    def get_error_html(self):
+        import brotli
+        fname = os.path.join(self.data_dir, "last-error.html.br")
+        if os.path.isfile(fname):
+            with open(fname, 'rb') as f:
+                return brotli.decompress(f.read()).decode('utf-8', errors='replace')
+        return False
+
     def save_xpath_data(self, data, as_error=False):
         import json
         import zlib

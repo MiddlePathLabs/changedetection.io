@@ -138,11 +138,6 @@
             <li><em>{{ _('Only important if package versions change or a CVE is mentioned') }}</em></li>
         </ul>
     </div>
-    {% if watch is defined and watch.get('llm_prefilter') %}
-    <div class="pure-form-message-inline" style="margin-top: 0.5em;">
-        <small>{{ _('AI pre-filter active: <code>%(filter)s</code> — narrows content scope before evaluation', filter=watch.get('llm_prefilter')|e) | safe }}</small>
-    </div>
-    {% endif %}
     {% endif %}
 
 </div>
