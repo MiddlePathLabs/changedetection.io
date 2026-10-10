@@ -154,7 +154,17 @@ class fetcher(Fetcher):
         if useragent:
             fetch_kwargs['useragent'] = useragent
         if self.proxy:
-            fetch_kwargs['proxy'] = self.proxy
+            from urllib.parse import urlsplit, urlunsplit
+            from changedetectionio.proxy_url import proxy_credentials
+            parsed_proxy = urlsplit(self.proxy)
+            username, password = proxy_credentials(self.proxy)
+            # Scrapling's browser accepts separate decoded credentials like Playwright.
+            server = urlunsplit(parsed_proxy._replace(netloc=parsed_proxy.netloc.rsplit('@', 1)[-1]))
+            fetch_kwargs['proxy'] = {'server': server}
+            if username is not None:
+                fetch_kwargs['proxy']['username'] = username
+            if password is not None:
+                fetch_kwargs['proxy']['password'] = password
         if self.browser_connection_url:
             fetch_kwargs['cdp_url'] = self.browser_connection_url
 

@@ -312,6 +312,11 @@ Math: {{ 1 + 1 }}") }}
                          {{ _('Sends a notification when the filter can no longer be seen on the page, good for knowing when the page changed and your filter will not work anymore.') }}
                         </span>
                     </div>
+                    <div class="pure-control-group">
+                        {{ render_checkbox_field(form.check_failure_notification_send) }}
+                        {{ render_checkbox_field(form.check_recovery_notification_send) }}
+                        <span class="pure-form-message-inline">{{ _('Send one failure alert after the threshold in Settings, then an optional recovery alert when checks succeed again. Uses this watch\'s notification destinations.') }}</span>
+                    </div>
                     <div class="field-group" id="notification-field-group">
                         {% if has_default_notification_urls %}
                         <div class="inline-warning">

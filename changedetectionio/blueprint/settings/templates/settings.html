@@ -67,6 +67,10 @@
                         {{ _('Set to empty to disable / no limit') }}
                         </span>
                     </div>
+                    <div class="pure-control-group">
+                        {{ render_field(form.application.form.check_failure_notification_threshold_attempts) }}
+                        <span class="pure-form-message-inline">{{ _('Applies to watches with repeated-failure alerts enabled. Set to 0 to disable failure and recovery alerts.') }}</span>
+                    </div>
 
                     <div class="pure-control-group">
                         {% if not hide_remove_pass %}

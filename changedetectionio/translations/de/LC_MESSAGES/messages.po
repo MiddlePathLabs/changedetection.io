@@ -589,6 +589,10 @@ msgid "Set to empty to disable / no limit"
 msgstr ""
 
 #: changedetectionio/blueprint/settings/templates/settings.html
+msgid "Applies to watches with repeated-failure alerts enabled. Set to 0 to disable failure and recovery alerts."
+msgstr ""
+
+#: changedetectionio/blueprint/settings/templates/settings.html
 msgid "Password protection for your changedetection.io application."
 msgstr ""
 
@@ -1368,6 +1372,7 @@ msgid "models available with your key"
 msgstr ""
 
 #: changedetectionio/blueprint/settings/templates/settings_llm_tab.html
+#: changedetectionio/templates/edit/include_ai_assist.html
 msgid "Request failed"
 msgstr ""
 
@@ -1877,6 +1882,10 @@ msgid "Filters"
 msgstr "Filter"
 
 #: changedetectionio/blueprint/ui/templates/diff.html
+msgid "Characters"
+msgstr ""
+
+#: changedetectionio/blueprint/ui/templates/diff.html
 msgid "Words"
 msgstr "Wörter"
 
@@ -2187,6 +2196,12 @@ msgid ""
 msgstr ""
 "Sendet eine Benachrichtigung, wenn der Filter auf der Seite nicht mehr sichtbar ist. So wissen Sie, wann sich die "
 "Seite geändert hat und Ihr Filter nicht mehr funktioniert."
+
+#: changedetectionio/blueprint/ui/templates/edit.html
+msgid ""
+"Send one failure alert after the threshold in Settings, then an optional recovery alert when checks succeed again. "
+"Uses this watch's notification destinations."
+msgstr ""
 
 #: changedetectionio/blueprint/ui/templates/edit.html
 msgid "Use the verify (✓) button to test if a condition passes against the current snapshot."
@@ -2814,6 +2829,10 @@ msgid "Set proxy for selected"
 msgstr ""
 
 #: changedetectionio/blueprint/watchlist/templates/watch-overview.html
+msgid "Download CSV"
+msgstr ""
+
+#: changedetectionio/blueprint/watchlist/templates/watch-overview.html
 msgid "Mark viewed"
 msgstr "Markierung angesehen"
 
@@ -3046,6 +3065,14 @@ msgstr ""
 
 #: changedetectionio/content_fetchers/requests.py
 msgid "Basic fast Plaintext/HTTP Client"
+msgstr ""
+
+#: changedetectionio/content_fetchers/scrapling_http.py
+msgid "Scrapling - Fast HTTP Client with browser TLS fingerprint"
+msgstr ""
+
+#: changedetectionio/content_fetchers/scrapling_stealth.py
+msgid "Scrapling Stealth Chrome - anti-bot/Cloudflare bypass"
 msgstr ""
 
 #: changedetectionio/blueprint/watchlist/templates/watch-overview-single-row.html changedetectionio/flask_app.py
@@ -3411,7 +3438,7 @@ msgstr ""
 msgid "CSS/JSONPath/JQ/XPath Filters"
 msgstr "CSS/xPath-Filter"
 
-#: changedetectionio/forms.py
+#: changedetectionio/forms.py changedetectionio/templates/edit/include_ai_assist.html
 msgid "Remove elements"
 msgstr "Elemente entfernen"
 
@@ -3427,7 +3454,7 @@ msgstr "Daten extrahieren"
 msgid "Title"
 msgstr "Titel"
 
-#: changedetectionio/forms.py
+#: changedetectionio/forms.py changedetectionio/templates/edit/include_ai_assist.html
 msgid "Ignore lines containing"
 msgstr "Ignorieren Sie alle übereinstimmenden Zeilen"
 
@@ -3494,6 +3521,14 @@ msgstr "Proxy"
 #: changedetectionio/forms.py
 msgid "Send a notification when the filter can no longer be found on the page"
 msgstr "Senden Sie eine Benachrichtigung, wenn der Filter nicht mehr auf der Seite gefunden werden kann"
+
+#: changedetectionio/forms.py
+msgid "Notify when checks repeatedly fail"
+msgstr ""
+
+#: changedetectionio/forms.py
+msgid "Notify when a failed watch recovers"
+msgstr ""
 
 # Context
 #: changedetectionio/forms.py
@@ -3729,6 +3764,10 @@ msgstr "Sollte null oder mehr Versuche enthalten"
 #: changedetectionio/forms.py
 msgid "Number of times the filter can be missing before sending a notification"
 msgstr "Häufigkeit, mit der der Filter fehlen darf, bevor eine Benachrichtigung gesendet wird"
+
+#: changedetectionio/forms.py
+msgid "Consecutive failed checks before sending an alert"
+msgstr ""
 
 #: changedetectionio/forms.py
 msgid "Model"
@@ -4043,6 +4082,20 @@ msgstr ""
 #: changedetectionio/processors/restock_diff/difference.py
 #: changedetectionio/processors/restock_diff/templates/restock_diff/difference.html
 msgid "Price history"
+msgstr ""
+
+#: changedetectionio/processors/restock_diff/forms.py
+msgid "Custom in-stock phrases"
+msgstr ""
+
+#: changedetectionio/processors/restock_diff/forms.py
+msgid "Custom out-of-stock phrases"
+msgstr ""
+
+#: changedetectionio/processors/restock_diff/forms.py
+msgid ""
+"One literal phrase per line. Matches ignore case, accents and repeated spaces. Custom phrases override automatic "
+"availability; out-of-stock wins if both match. Use specific phrases to avoid matching other products on the page."
 msgstr ""
 
 #: changedetectionio/processors/restock_diff/forms.py
@@ -4753,6 +4806,101 @@ msgstr "Suchbegriff eingeben..."
 msgid "Searching in current group '%(title)s' only"
 msgstr "Suche nur in Gruppe '%(title)s'"
 
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "AI setup assistant"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid ""
+"Each button asks the AI once, using the saved page and history. Suggestions are checked against the real page first, "
+"and are only added to the form when you choose. Nothing changes until you press Save."
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Explain this error"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Why this watch is failing, and how to fix it."
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Suggest filters"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "What do you want to watch on this page? (defaults to the AI Change Intent above)"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Find noisy lines"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Looks at recent history for lines that keep changing without meaning (times, counters) and suggests text to ignore."
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Suggest groups"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Suggests which groups (tags) this watch belongs in."
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Asking the AI…"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "No suggestions - nothing useful was found, or nothing the AI proposed matched the page."
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Add selected"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Added to the form - press Save to keep it."
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "CSS/XPath filters"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Trigger text"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Groups"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "match"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "matches"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "new group"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+#, python-format
+msgid "With these rules, %(n)s of the last %(m)s changes would not have been reported."
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Suggested fixes"
+msgstr ""
+
+#: changedetectionio/templates/edit/include_ai_assist.html
+msgid "Based on"
+msgstr ""
+
 #: changedetectionio/templates/edit/include_llm_intent.html
 msgid ""
 "<strong>On</strong> &ndash; every watch in this group uses the AI settings below, unless it fills in its own. "
@@ -4811,11 +4959,6 @@ msgstr ""
 
 #: changedetectionio/templates/edit/include_llm_intent.html
 msgid "Only important if package versions change or a CVE is mentioned"
-msgstr ""
-
-#: changedetectionio/templates/edit/include_llm_intent.html
-#, python-format
-msgid "AI pre-filter active: <code>%(filter)s</code> — narrows content scope before evaluation"
 msgstr ""
 
 #: changedetectionio/templates/edit/include_llm_intent.html

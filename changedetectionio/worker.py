@@ -80,6 +80,8 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
         update_handler = None
         watch = None
         processing_exception = None  # Reset at start of each iteration to prevent state bleeding
+        check_started = False
+        check_succeeded = False
 
         try:
             # Efficient blocking via run_in_executor (no polling overhead!)
@@ -158,6 +160,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                 watch = datastore.data['watching'].get(uuid)
 
                 logger.info(f"Worker {worker_id} processing watch UUID {uuid} Priority {queued_item_data.priority} URL {watch['url']}")
+                check_started = True
 
                 try:
                     # Retrieve signal by name to ensure thread-safe access across worker threads
@@ -197,8 +200,10 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         executor,
                         lambda: update_handler.run_changedetection(watch=watch)
                     )
+                    check_succeeded = True
 
                 except PermissionError as e:
+                    datastore.update_watch(uuid=uuid, update_obj={'last_error': str(e)})
                     logger.critical(f"File permission error updating file, watch: {uuid}")
                     logger.critical(str(e))
                     process_changedetection_results = False
@@ -304,6 +309,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     process_changedetection_results = False
 
                 except content_fetchers_exceptions.checksumFromPreviousCheckWasTheSame as e:
+                    check_succeeded = True
                     # Yes fine, so nothing todo, don't continue to process.
                     process_changedetection_results = False
                     changed_detected = False
@@ -609,6 +615,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     except Exception as e:
 
                         logger.critical(f"Worker {worker_id} exception in process_changedetection_results")
+                        check_succeeded = False
                         logger.exception(f"Worker {worker_id} full exception details:")
                         datastore.update_watch(uuid=uuid, update_obj={'last_error': str(e)})
 
@@ -665,6 +672,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
         except Exception as e:
             # Store the processing exception for plugin finalization hook
+            check_succeeded = False
             processing_exception = e
 
             logger.error(f"Worker {worker_id} unexpected error processing {uuid}: {e}")
@@ -677,6 +685,12 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
         finally:
             # Always cleanup - this runs whether there was an exception or not
             if uuid:
+                if check_started:
+                    try:
+                        from changedetectionio.watch_health import record_check_outcome
+                        record_check_outcome(datastore, notification_q, uuid, check_succeeded)
+                    except Exception as health_error:
+                        logger.error(f"Could not record check health for {uuid}: {health_error}")
                 # Capture references for plugin finalize hook BEFORE cleanup
                 # (cleanup may delete these variables, but plugins need the original references)
                 finalize_handler = update_handler  # Capture now, before cleanup deletes it

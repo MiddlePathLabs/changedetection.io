@@ -216,6 +216,8 @@ class watch_base(dict):
             'llm_prefilter': None,           # Unused - the never-wired AI pre-filter; kept so stored watches still load (see llm/assist.py suggest_filters)
             'method': 'GET',
             'notification_alert_count': 0,
+            'check_failure_notification_send': False,
+            'check_recovery_notification_send': True,
             'notification_body': None,
             'notification_format': USE_SYSTEM_DEFAULT_NOTIFICATION_FORMAT_FOR_WATCH,
             'notification_muted': False,

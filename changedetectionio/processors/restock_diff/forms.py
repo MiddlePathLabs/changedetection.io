@@ -8,10 +8,14 @@ from wtforms.fields.form import FormField
 from wtforms.form import Form
 from flask_babel import lazy_gettext as _l
 
-from changedetectionio.forms import processor_text_json_diff_form
+from changedetectionio.forms import processor_text_json_diff_form, StringListField
 
 
 class RestockSettingsForm(Form):
+    custom_instock_strings = StringListField(_l('Custom in-stock phrases'), [validators.Optional()], default=[])
+    custom_outofstock_strings = StringListField(
+        _l('Custom out-of-stock phrases'), [validators.Optional()], default=[],
+        description=_l('One literal phrase per line. Matches ignore case, accents and repeated spaces. Custom phrases override automatic availability; out-of-stock wins if both match. Use specific phrases to avoid matching other products on the page.'))
     in_stock_processing = RadioField(label=_l('Re-stock detection'), choices=[
         ('in_stock_only', _l("In Stock only (Out Of Stock -> In Stock only)")),
         ('all_changes', _l("Any availability changes")),
@@ -62,6 +66,11 @@ class processor_settings_form(processor_text_json_diff_form):
                 <fieldset class="pure-group">
                     {{ render_checkbox_field(form.processor_config_restock_diff.follow_price_changes) }}
                     <span class="pure-form-message-inline">Changes in price should trigger a notification</span>
+                </fieldset>
+                <fieldset class="pure-group">
+                    {{ render_field(form.processor_config_restock_diff.custom_instock_strings) }}
+                    {{ render_field(form.processor_config_restock_diff.custom_outofstock_strings) }}
+                    <span class="pure-form-message-inline">{{ form.processor_config_restock_diff.custom_outofstock_strings.description }}</span>
                 </fieldset>
                 <fieldset class="pure-group price-change-minmax">
                     {{ render_field(form.processor_config_restock_diff.price_change_min, placeholder=watch.get('restock', {}).get('price')) }}

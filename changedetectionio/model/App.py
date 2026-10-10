@@ -46,6 +46,7 @@ class model(dict):
                     'empty_pages_are_a_change': False,
                     'fetch_backend': getenv("DEFAULT_FETCH_BACKEND", "html_requests"),
                     'filter_failure_notification_threshold_attempts': _FILTER_FAILURE_THRESHOLD_ATTEMPTS_DEFAULT,
+                    'check_failure_notification_threshold_attempts': 6,
                     'global_ignore_text': [], # List of text to ignore when calculating the comparison checksum
                     'global_subtractive_selectors': [],
                     'history_snapshot_max_length': None,

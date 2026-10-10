@@ -554,6 +554,14 @@ components:
           type: boolean
           default: true
           description: Send notification when filters fail to match content
+        check_failure_notification_send:
+          type: boolean
+          default: false
+          description: Send one alert after consecutive failed checks reach the configured threshold
+        check_recovery_notification_send:
+          type: boolean
+          default: true
+          description: Send a recovery alert after a failure alert when checks succeed again
 
         # History & Display
         use_page_title_in_list:
@@ -801,6 +809,16 @@ components:
                   enum: [in_stock_only, all_changes, 'off']
                 follow_price_changes:
                   type: boolean
+                custom_instock_strings:
+                  type: array
+                  items:
+                    type: string
+                  description: Literal visible-text phrases indicating stock availability
+                custom_outofstock_strings:
+                  type: array
+                  items:
+                    type: string
+                  description: Literal visible-text phrases indicating unavailability; take precedence over in-stock matches
                 price_change_min:
                   type: [number, 'null']
                 price_change_max:
@@ -1394,8 +1412,9 @@ paths:
         - `html`: HTML format with (removed) and (added) text
         - `htmlcolor`: Rich HTML with colored highlights (green for additions, red for deletions)
 
-        **Word-Level Diffing:**
+        **Word- and Character-Level Diffing:**
         - Enable word-level granularity with `word_diff=true` for detailed inline comparisons
+        - Use `type=diffWords` for word-level or `type=diffChars` for character-level comparisons
         - Disable with `word_diff=false` for line-level comparisons only (default false/off, line-level mode by default)
 
         **Raw Diff Output:**
@@ -1529,12 +1548,13 @@ paths:
             Diff granularity type:
             - `diffLines` (default): Line-level comparison, showing which lines changed
             - `diffWords`: Word-level comparison, showing which words changed within lines
+            - `diffChars`: Character-level comparison, showing which characters changed within lines
 
             This parameter is an alternative to `word_diff` for better alignment with the UI.
-            If both are specified, `type=diffWords` will enable word-level diffing.
+            If both are specified, `type=diffWords` or `type=diffChars` will enable the selected inline granularity.
           schema:
             type: string
-            enum: [diffLines, diffWords]
+            enum: [diffLines, diffWords, diffChars]
             default: diffLines
         - name: changesOnly
           in: query

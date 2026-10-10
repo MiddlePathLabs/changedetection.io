@@ -1012,6 +1012,8 @@ class processor_text_json_diff_form(commonSettingsForm):
     proxy = RadioField(_l('Proxy'))
     # filter_failure_notification_send @todo make ternary
     filter_failure_notification_send = BooleanField(_l('Send a notification when the filter can no longer be found on the page'), default=False)
+    check_failure_notification_send = BooleanField(_l('Notify when checks repeatedly fail'), default=False)
+    check_recovery_notification_send = BooleanField(_l('Notify when a failed watch recovers'), default=True)
     notification_muted = TernaryNoneBooleanField(_l('Notifications'), default=None, yes_text=_l("Muted"), no_text=_l("On"))
     notification_screenshot = BooleanField(_l('Attach screenshot to notification (where possible)'), default=False)
 
@@ -1242,6 +1244,10 @@ class globalSettingsApplicationForm(commonSettingsForm):
 
     history_snapshot_max_length = IntegerField(_l('Number of history items per watch to keep'), render_kw={"style": "width: 5em;"}, validators=[validators.Optional(), validators.NumberRange(min=2)])
     ui = FormField(globalSettingsApplicationUIForm)
+    check_failure_notification_threshold_attempts = IntegerField(
+        _l('Consecutive failed checks before sending an alert'), default=6,
+        render_kw={"style": "width: 5em;"},
+        validators=[validators.NumberRange(min=0)])
 
 
 class globalSettingsLLMForm(Form):

@@ -480,6 +480,8 @@ class perform_site_check(difference_detection_processor):
                 break
 
 
+        from .stock_phrases import custom_stock_status
+        custom_in_stock = custom_stock_status(self.fetcher.content, restock_settings)
         itemprop_availability = {}
         multiple_prices_found = False
 
@@ -588,7 +590,7 @@ class perform_site_check(difference_detection_processor):
         else:
             update_obj['restock']['last_price'] = old_restock.get('last_price')  # unchanged: keep the existing reference
 
-        if not self.fetcher.instock_data and not itemprop_availability.get('availability') and not itemprop_availability.get('price'):
+        if custom_in_stock is None and not self.fetcher.instock_data and not itemprop_availability.get('availability') and not itemprop_availability.get('price'):
             raise ProcessorException(
                 message=f"Unable to extract restock data for this page unfortunately. (Got code {self.fetcher.get_last_status_code()} from server), no embedded stock information was found and nothing interesting in the text, try using this watch with Chrome.",
                 url=watch.get('url'),
@@ -612,6 +614,9 @@ class perform_site_check(difference_detection_processor):
                     f"Lie detected in the availability machine data!! when scraping said its not in stock!! itemprop was '{itemprop_availability}' and scraped from browser was '{self.fetcher.instock_data}' update obj was {update_obj['restock']} ")
                 logger.warning(f"Setting instock to FALSE, scraper found '{self.fetcher.instock_data}' in the body but metadata reported not-in-stock")
                 update_obj['restock']["in_stock"] = False
+
+        if custom_in_stock is not None:
+            update_obj['restock']['in_stock'] = custom_in_stock
 
         # What we store in the snapshot
         price = update_obj.get('restock').get('price') if update_obj.get('restock').get('price') else ""
