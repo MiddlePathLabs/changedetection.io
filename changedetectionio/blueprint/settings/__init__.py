@@ -235,6 +235,7 @@ def construct_blueprint(datastore: ChangeDetectionStore):
             get_llm_config as _get_llm_cfg,
             llm_configured_via_env,
             get_global_token_budget_month,
+            normalise_llm_metrics,
         )
         llm_config = _get_llm_cfg(datastore) or {}
         llm_env_configured = llm_configured_via_env()
@@ -248,6 +249,31 @@ def construct_blueprint(datastore: ChangeDetectionStore):
         # value and the merge below is a no-op for it.
         llm_provider_locked = bool(llm_config.get('api_key')) and not llm_env_configured
         llm_stored = datastore.data['settings']['application'].get('llm') or {}
+        llm_operation_metrics = normalise_llm_metrics(llm_stored.get('operation_metrics'))
+        llm_has_metrics = any(
+            any(value for value in bucket.values())
+            for bucket in llm_operation_metrics.values()
+        )
+        llm_watch_metrics = []
+        for _watch in datastore.data.get('watching', {}).values():
+            _metrics = normalise_llm_metrics(_watch.get('llm_metrics'))
+            _tokens = sum(bucket['tokens'] for bucket in _metrics.values())
+            _failures = sum(bucket['fail_open'] for bucket in _metrics.values())
+            if _tokens or _failures or any(
+                bucket['dispatched_calls'] or bucket['cache_hits'] or bucket['cache_lookups']
+                for bucket in _metrics.values()
+            ):
+                llm_watch_metrics.append({
+                    'uuid': _watch.get('uuid', ''),
+                    'label': _watch.label,
+                    'metrics': _metrics,
+                    'tokens': _tokens,
+                    'fail_open': _failures,
+                    'cost': sum(bucket['estimated_cost_usd'] for bucket in _metrics.values()),
+                })
+        llm_watch_metrics.sort(
+            key=lambda item: (item['tokens'], item['fail_open'], item['cost']), reverse=True,
+        )
         llm_token_budget_month = get_global_token_budget_month(datastore)
         llm_token_budget_month_env = get_global_token_budget_month()  # env var only, for readonly logic
         _max_input_chars_env_str = os.getenv('LLM_MAX_INPUT_CHARS', '').strip()
@@ -263,7 +289,10 @@ def construct_blueprint(datastore: ChangeDetectionStore):
                                 llm_config=llm_config,
                                 llm_env_configured=llm_env_configured,
                                 llm_provider_locked=llm_provider_locked,
-                                llm_stored=llm_stored,
+                                 llm_stored=llm_stored,
+                                 llm_operation_metrics=llm_operation_metrics,
+                                 llm_has_metrics=llm_has_metrics,
+                                 llm_watch_metrics=llm_watch_metrics,
                                 llm_token_budget_month=llm_token_budget_month,
                                 llm_token_budget_month_env=llm_token_budget_month_env,
                                 llm_max_input_chars_env=llm_max_input_chars_env,

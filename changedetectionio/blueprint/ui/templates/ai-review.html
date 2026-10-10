@@ -1,0 +1,83 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="ai-review-page edit-form">
+  <div class="box-wrap inner">
+    <main>
+    <h1>{{ _('AI change review') }} — {{ watch.label }}</h1>
+    <p>
+        {{ _('History-linked AI decisions are shown here as plain text. A suppressed snapshot advances the baseline and does not notify.') }}
+    </p>
+
+    <nav aria-label="{{ _('AI review filters') }}">
+        <a href="{{ url_for('ui.ui_diff.ai_review', uuid=uuid, status='suppressed') }}">{{ _('Suppressed') }}</a> ·
+        <a href="{{ url_for('ui.ui_diff.ai_review', uuid=uuid, status='alerted') }}">{{ _('Alerted') }}</a> ·
+        <a href="{{ url_for('ui.ui_diff.ai_review', uuid=uuid, status='reviewed') }}">{{ _('Reviewed') }}</a> ·
+        <a href="{{ url_for('ui.ui_diff.ai_review', uuid=uuid, status='all') }}">{{ _('All AI decisions') }}</a>
+    </nav>
+
+    <section aria-labelledby="ai-review-retention-heading">
+        <h2 id="ai-review-retention-heading">{{ _('Evidence retention') }}</h2>
+        <form method="post" action="{{ url_for('ui.ui_diff.ai_review_retention', uuid=uuid) }}" class="pure-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label for="ai-review-retention-count">{{ _('Detailed decisions to retain') }}</label>
+            <input id="ai-review-retention-count" name="retention_count" type="number" min="1" max="500" value="{{ retention_count }}">
+            <button class="pure-button" type="submit">{{ _('Save retention') }}</button>
+        </form>
+        <p>{{ _('%(count)s detailed decision(s) retained. Older history markers remain visible without their explanation or evaluated diff.', count=retained_count) }}</p>
+        {% if older_evidence_count %}
+        <p class="tip">{{ _('%(count)s older marker(s) have no retained evidence.', count=older_evidence_count) }}</p>
+        {% endif %}
+    </section>
+
+    <p>
+        <a class="pure-button" href="{{ url_for('ui.ui_diff.ai_review_export', uuid=uuid) }}">{{ _('Export reviewed examples') }}</a>
+        <a class="pure-button" href="{{ url_for('ui.ui_diff.ai_replay', uuid=uuid) }}">{{ _('Replay an intent against history') }}</a>
+    </p>
+
+    <section aria-labelledby="ai-review-results-heading">
+        <h2 id="ai-review-results-heading">{{ _('Review results') }}</h2>
+        {% for entry in entries %}
+        {% set record = entry.record %}
+        <article class="ai-review-entry" data-version="{{ entry.version }}">
+            <h3>
+                {{ entry.version }}
+                {% if entry.marker.suppressed_by_ai %}
+                    <span>({{ _('suppressed by AI') }})</span>
+                {% else %}
+                    <span>({{ _('alerted') }})</span>
+                {% endif %}
+            </h3>
+            {% if record %}
+            <dl>
+                <dt>{{ _('Status') }}</dt><dd>{{ record.status }}</dd>
+                <dt>{{ _('Coverage') }}</dt><dd>{{ record.coverage }}</dd>
+                <dt>{{ _('Intent') }}</dt><dd>{{ record.intent }}</dd>
+                <dt>{{ _('Model') }}</dt><dd>{{ record.model }}</dd>
+                <dt>{{ _('Prompt version') }}</dt><dd>{{ record.prompt_version }}</dd>
+            </dl>
+            <p><strong>{{ _('Explanation') }}</strong></p>
+            <p>{{ record.explanation }}</p>
+            <p><strong>{{ _('Evaluated diff') }}</strong></p>
+            <pre class="monospace-preview">{{ record.evaluated_diff }}</pre>
+            {% if record.feedback == 'should_alert' %}
+            <p class="tip">{{ _('Marked: This should have alerted me.') }}</p>
+            {% endif %}
+            {% if entry.marker.suppressed_by_ai %}
+            <form method="post" action="{{ url_for('ui.ui_diff.ai_review_feedback', uuid=uuid, version=entry.version) }}" class="pure-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="feedback" value="should_alert">
+                <button class="pure-button pure-button-primary" type="submit">{{ _('This should have alerted me') }}</button>
+            </form>
+            {% endif %}
+            {% else %}
+            <p class="tip">{{ _('Evidence was not retained for this older history version.') }}</p>
+            {% endif %}
+        </article>
+        {% else %}
+        <p>{{ _('No AI decisions match this filter.') }}</p>
+        {% endfor %}
+    </section>
+    </main>
+  </div>
+</div>
+{% endblock %}

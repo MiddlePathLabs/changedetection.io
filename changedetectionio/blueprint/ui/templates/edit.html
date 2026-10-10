@@ -352,9 +352,20 @@ Math: {{ 1 + 1 }}") }}
                 {% include "edit/include_ai_assist.html" %}
             </div>
             {% endif %}
-            <div class="tab-pane-inner" id="filters-and-triggers">
+             <div class="tab-pane-inner" id="filters-and-triggers">
 
                 <span id="activate-text-preview" class="pure-button pure-button-primary button-xsmall">{{ _('Activate preview') }}</span>
+                {% if watch.get('filter_repair_previous') %}
+                <button type="button" id="filter-repair-restore" class="pure-button button-xsmall">
+                    {{ _('Restore previous filter configuration') }}
+                </button>
+                <span id="filter-repair-restore-status" class="pure-form-message-inline">
+                    {{ _('Restoring only fills the draft form. Press Save to keep it.') }}
+                </span>
+                <script>
+                    window.filter_repair_previous = {{ watch.get('filter_repair_previous')|tojson }};
+                </script>
+                {% endif %}
               <div>
               <div id="edit-text-filter">
 
@@ -425,7 +436,7 @@ Math: {{ 1 + 1 }}") }}
                     #llm-preview-result[data-found="0"] .llm-preview-verdict { color: #888; }
                 </style>
                 {% endif %}
-                <div class="minitabs-wrapper">
+                 <div class="minitabs-wrapper">
                   <div class="minitabs-content">
                       <div id="text-preview-inner" class="monospace-preview">
                           <p>{{ _('Loading...') }}</p>
@@ -434,8 +445,9 @@ Math: {{ 1 + 1 }}") }}
                           <p>{{ _('Loading...') }}</p>
                       </div>
                   </div>
-                </div>
-                {{ highlight_trigger_ignored_explainer() }}
+                 </div>
+                 <div id="filter-preview-analysis" class="border-fieldset" style="display:none; margin-top:0.8em;" aria-live="polite"></div>
+                 {{ highlight_trigger_ignored_explainer() }}
             </div>
           </div>
         </div>

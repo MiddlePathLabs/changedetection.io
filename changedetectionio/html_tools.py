@@ -94,6 +94,22 @@ def lxml_html_parser():
 TEXT_FILTER_LIST_LINE_SUFFIX = "<br>"
 TRANSLATE_WHITESPACE_TABLE = str.maketrans('', '', '\r\n\t ')
 PERL_STYLE_REGEX = r'^/(.*?)/([a-z]*)?$'
+BOUNDED_REGEX_TIMEOUT_SECONDS = 0.05
+
+
+def compile_bounded_regex(pattern, flags=0, timeout=BOUNDED_REGEX_TIMEOUT_SECONDS):
+    """Compile a regex with a runtime-bounded evaluation engine.
+
+    The normal processor path deliberately keeps Python ``re`` semantics. Preview
+    and model-suggestion paths pass a timeout and use the installed ``regex``
+    engine, which can abort pathological backtracking without inventing a second
+    regex language or evaluating an untrusted pattern in-process with ``re``.
+    """
+    try:
+        import regex as bounded_regex
+    except ModuleNotFoundError as exc:
+        raise RuntimeError('The bounded regex engine is not installed.') from exc
+    return bounded_regex.compile(pattern, flags), timeout
 
 # Whitespace is allowed after the tag name ("</title >") but not after "<" - "< title>" is text, not a tag
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title\s*>", re.I | re.S)
@@ -720,7 +736,7 @@ def extract_json_as_string(content, json_filter, ensure_is_ldjson_info_type=None
 #
 # wordlist - list of regex's (str) or words (str)
 # Preserves all linefeeds and other whitespacing, its not the job of this to remove that
-def strip_ignore_text(content, wordlist, mode="content"):
+def strip_ignore_text(content, wordlist, mode="content", regex_timeout=None):
     ignore_text = []
     ignore_regex = []
     ignore_regex_multiline = []
@@ -736,7 +752,11 @@ def strip_ignore_text(content, wordlist, mode="content"):
         # Is it a regex?
         res = re.search(PERL_STYLE_REGEX, k, re.IGNORECASE)
         if res:
-            res = re.compile(perl_style_slash_enclosed_regex_to_options(k))
+            pattern = perl_style_slash_enclosed_regex_to_options(k)
+            if regex_timeout is None:
+                res = re.compile(pattern)
+            else:
+                res, _ = compile_bounded_regex(pattern, timeout=regex_timeout)
             if res.flags & re.DOTALL or res.flags & re.MULTILINE:
                 ignore_regex_multiline.append(res)
             else:
@@ -745,7 +765,8 @@ def strip_ignore_text(content, wordlist, mode="content"):
             ignore_text.append(k.strip())
 
     for r in ignore_regex_multiline:
-        for match in r.finditer(content):
+        finditer_kwargs = {'timeout': regex_timeout} if regex_timeout is not None else {}
+        for match in r.finditer(content, **finditer_kwargs):
             content_lines = content[:match.end()].splitlines(keepends=True)
             match_lines = content[match.start():match.end()].splitlines(keepends=True)
 
@@ -768,10 +789,11 @@ def strip_ignore_text(content, wordlist, mode="content"):
             if l.lower() in line.lower():
                 got_match = True
 
-        if not got_match:
-            for r in ignore_regex:
-                if r.search(line):
-                    got_match = True
+            if not got_match:
+                for r in ignore_regex:
+                    search_kwargs = {'timeout': regex_timeout} if regex_timeout is not None else {}
+                    if r.search(line, **search_kwargs):
+                        got_match = True
 
         if got_match:
             ignored_lines.append(line_index)

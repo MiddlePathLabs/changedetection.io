@@ -30,6 +30,7 @@ from loguru import logger
 # handful of operators clicking "Summary" at once cannot fan out into provider rate-limiting
 # or a surprise token bill.  Extra clicks queue.
 DEFAULT_MAX_WORKERS = 2
+DEFAULT_MAX_PENDING = 32
 
 
 class SummaryJobFailed(Exception):
@@ -41,10 +42,18 @@ class SummaryJobFailed(Exception):
         self.http_status = http_status
 
 
+class SummaryQueueFullError(Exception):
+    """Raised when a distinct summary job would exceed the pending-job limit."""
+
+    def __init__(self, max_pending):
+        super().__init__(f"Summary job queue is full ({max_pending} jobs outstanding).")
+        self.max_pending = max_pending
+
+
 class SummaryJobRegistry:
     """In-flight tracking + a small thread pool for on-demand summary generation."""
 
-    def __init__(self, max_workers=None):
+    def __init__(self, max_workers=None, max_pending=DEFAULT_MAX_PENDING):
         self._lock = threading.Lock()
         # key -> epoch when the worker picked the job up, or None while it is still queued
         # behind another generation (the pool is deliberately small, see DEFAULT_MAX_WORKERS).
@@ -52,6 +61,7 @@ class SummaryJobRegistry:
         self._errors = {}  # key -> (http_status, message)
         self._pool = None
         self._max_workers = max_workers or int(os.getenv('LLM_SUMMARY_WORKERS', DEFAULT_MAX_WORKERS))
+        self._max_pending = max_pending
 
     def _get_pool(self):
         """Created on first use - importing this module must never spawn threads.
@@ -90,17 +100,20 @@ class SummaryJobRegistry:
             return self._errors.pop(key, None)
 
     def submit(self, key, fn, on_settled=None):
-        """Run `fn()` on the pool unless `key` is already running.
+        """Run `fn()` on the pool unless `key` is already pending.
 
         `fn` is responsible for persisting its own result before returning; see the ordering note
         in `_run`.  `on_settled(key)` is called once the job has finished either way - used to
         signal the browser over Socket.IO so it does not have to poll.  Returns True if this call
-        started the work, False if it was already in flight.
+        started the work, False if it was already in flight.  Raises
+        :class:`SummaryQueueFullError` for distinct work when all pending capacity is occupied.
         """
         with self._lock:
             if key in self._pending:
                 logger.debug(f"LLM summary job already in flight, not starting a second: {key}")
                 return False
+            if len(self._pending) >= self._max_pending:
+                raise SummaryQueueFullError(self._max_pending)
             # Marked pending *before* the pool sees it, so a poll arriving between submit() and
             # the worker actually starting still gets 'pending' rather than 'idle'.  No start
             # time yet - that is stamped in _run when a worker is free to take it.

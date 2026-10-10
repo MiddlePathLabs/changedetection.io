@@ -35,6 +35,8 @@ from . import watch_base
 from .persistence import EntityPersistenceMixin
 import os
 import re
+import json
+import time
 from pathlib import Path
 from loguru import logger
 
@@ -43,6 +45,10 @@ from ..html_tools import TRANSLATE_WHITESPACE_TABLE
 
 FAVICON_RESAVE_THRESHOLD_SECONDS=86400
 BROTLI_COMPRESS_SIZE_THRESHOLD = int(os.getenv('SNAPSHOT_BROTLI_COMPRESSION_THRESHOLD', 1024*20))
+AI_DECISION_METADATA_FILENAME = 'ai-decisions.json'
+AI_DECISION_RETENTION_DEFAULT = 50
+AI_DECISION_RETENTION_MAX = 500
+HISTORY_INITIAL_VERSION_SUFFIX = '.initial'
 
 # Module-level favicon filename cache: data_dir → basename (or None)
 # Keyed by data_dir so it survives Watch object recreation, deepcopy, and concurrent requests.
@@ -275,15 +281,48 @@ class model(EntityPersistenceMixin, watch_base):
 
     @property
     def viewed(self):
-        # Don't return viewed when last_viewed is 0 and newest_key is 0
-        if int(self['last_viewed']) and int(self['last_viewed']) >= int(self.newest_history_key) :
+        latest_alert = self._latest_non_suppressed_history_key()
+        if latest_alert is None:
+            # Preserve the existing first-snapshot semantics. There is no change
+            # to view until a second history entry exists.
+            return bool(int(self['last_viewed'])) and int(self['last_viewed']) >= int(self.newest_history_key)
+        if latest_alert == 0:
+            # Every post-baseline history entry is an explicitly suppressed
+            # baseline. This is viewed without changing last_viewed.
             return True
-
-        return False
+        return bool(int(self['last_viewed'])) and int(self['last_viewed']) >= latest_alert
 
     @property
     def has_unviewed(self):
-        return int(self.newest_history_key) > int(self['last_viewed']) and self.__history_n >= 2
+        latest_alert = self._latest_non_suppressed_history_key()
+        return latest_alert is not None and latest_alert > int(self['last_viewed'])
+
+    def _latest_non_suppressed_history_key(self):
+        """Return the newest retained history version that should be unread.
+
+        The initial baseline is identified by a stable sidecar, rather than by
+        its position in the currently retained history. This matters after
+        retention removes older snapshots: an unmarked retained version must
+        remain alert-worthy unless it is the known initial baseline. Only an
+        explicit ``suppressed_by_ai`` marker removes a non-baseline version
+        from unread semantics. ``0`` means all retained versions were either
+        the known baseline or explicitly suppressed; ``None`` means there is
+        no history yet.
+        """
+        history_keys = list(self.history.keys())
+        if not history_keys:
+            return None
+
+        initial_version = self.history_initial_version
+        markers = self.get_ai_history_markers()
+        for version in reversed(history_keys):
+            if initial_version is not None and str(version) == initial_version:
+                continue
+            marker = markers.get(str(version))
+            if isinstance(marker, dict) and marker.get('suppressed_by_ai') is True:
+                continue
+            return int(version)
+        return 0
 
     def _resolve_link(self, url, flash_on_template_error=True):
         """Validate, Jinja2-render and de-'source:' a URL so it is safe to put in an href.
@@ -363,6 +402,39 @@ class model(EntityPersistenceMixin, watch_base):
             return 'history.txt'
         else:
             return f'history-{processor}.txt'
+
+    @property
+    def history_initial_version_path(self):
+        """Return the sidecar path for the active history index's baseline."""
+        if not self.data_dir:
+            return None
+        return os.path.join(self.data_dir, self.history_index_filename + HISTORY_INITIAL_VERSION_SUFFIX)
+
+    @property
+    def history_initial_version(self):
+        """Return the stable initial version, or ``None`` for unknown legacy history.
+
+        The sidecar deliberately remains independent of the bounded history
+        index. Missing sidecars are treated conservatively: retained legacy
+        versions are alert-worthy unless an explicit suppression marker says
+        otherwise.
+        """
+        path = self.history_initial_version_path
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                version = f.read().strip()
+        except OSError as e:
+            logger.warning(f"Could not read initial history version for {self.get('uuid')}: {e}")
+            return None
+        return version or None
+
+    def _write_history_initial_version(self, version):
+        """Persist the first snapshot identity for the active history index."""
+        path = self.history_initial_version_path
+        if path:
+            self._write_atomic(path, f'{version}\n'.encode('utf-8'))
 
     def clear_watch(self):
         import pathlib
@@ -702,7 +774,164 @@ class model(EntityPersistenceMixin, watch_base):
 
         # reimport
         bump = self.history
+        self._prune_ai_decision_metadata(active_versions=set(keep_part.keys()))
         gc_debounce.collect('watch.history_bump')
+
+    @property
+    def ai_decision_metadata_path(self):
+        return os.path.join(self.data_dir, AI_DECISION_METADATA_FILENAME)
+
+    @staticmethod
+    def validate_ai_decision_retention(value):
+        """Return a safe detailed-decision retention count, or ``None`` when invalid."""
+        if isinstance(value, bool):
+            return None
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        if count < 1 or count > AI_DECISION_RETENTION_MAX:
+            return None
+        return count
+
+    def get_ai_decision_retention(self):
+        configured = self.validate_ai_decision_retention(self.get('llm_ai_decision_retention'))
+        return configured if configured is not None else AI_DECISION_RETENTION_DEFAULT
+
+    def _read_ai_decision_metadata(self):
+        if not self.data_dir or not os.path.isfile(self.ai_decision_metadata_path):
+            return {'decisions': {}, 'markers': {}}
+        try:
+            with open(self.ai_decision_metadata_path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.warning(f"Could not read AI decision metadata for {self.get('uuid')}: {e}")
+            return {'decisions': {}, 'markers': {}}
+
+        if not isinstance(raw, dict):
+            return {'decisions': {}, 'markers': {}}
+        decisions = raw.get('decisions', {})
+        markers = raw.get('markers', {})
+        if not isinstance(decisions, dict):
+            decisions = {}
+        if not isinstance(markers, dict):
+            markers = {}
+        return {'decisions': decisions, 'markers': markers}
+
+    def _write_ai_decision_metadata(self, metadata):
+        self.ensure_data_dir_exists()
+        payload = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        self._write_atomic(self.ai_decision_metadata_path, payload.encode('utf-8'))
+
+    def _prune_ai_decision_metadata(self, active_versions=None):
+        """Prune detailed decisions by count and all markers by retained history."""
+        if not self.data_dir:
+            return {'decisions': {}, 'markers': {}}
+        if active_versions is None:
+            active_versions = {str(version) for version in self.history.keys()}
+        else:
+            active_versions = {str(version) for version in active_versions}
+
+        metadata = self._read_ai_decision_metadata()
+        old_decisions = metadata['decisions']
+        old_markers = metadata['markers']
+        decisions = {
+            str(version): value for version, value in old_decisions.items()
+            if str(version) in active_versions and isinstance(value, dict)
+        }
+        sorted_versions = sorted(
+            decisions,
+            key=lambda version: int(version) if str(version).lstrip('-').isdigit() else 0,
+        )
+        retained_versions = set(sorted_versions[-self.get_ai_decision_retention():])
+        decisions = {version: decisions[version] for version in sorted_versions if version in retained_versions}
+        markers = {
+            str(version): value for version, value in old_markers.items()
+            if str(version) in active_versions and isinstance(value, dict)
+        }
+        for version, decision in decisions.items():
+            marker = dict(markers.get(version) or {})
+            marker.update({
+                'ai_decision': True,
+                'suppressed_by_ai': bool(decision.get('suppressed_by_ai')),
+                'has_evidence': True,
+                'status': decision.get('status', ''),
+            })
+            markers[version] = marker
+        for version, marker in markers.items():
+            marker['has_evidence'] = version in decisions
+
+        result = {'decisions': decisions, 'markers': markers}
+        if result != metadata:
+            self._write_ai_decision_metadata(result)
+        return result
+
+    def get_ai_history_decisions(self):
+        """Return retained, history-linked AI decisions keyed by snapshot version."""
+        return dict(self._prune_ai_decision_metadata()['decisions'])
+
+    def get_ai_history_markers(self):
+        """Return suppression/decision markers, including versions past detail retention."""
+        return dict(self._prune_ai_decision_metadata()['markers'])
+
+    def get_ai_decision(self, version):
+        decision = self.get_ai_history_decisions().get(str(version))
+        return dict(decision) if isinstance(decision, dict) else None
+
+    def save_ai_decision(self, version, decision, intent='', from_version=None,
+                         suppressed_by_ai=False):
+        """Persist one evaluation beside history, retaining only bounded detail."""
+        if not isinstance(decision, dict) or not self.data_dir:
+            return False
+        version = str(version)
+        if version not in {str(item) for item in self.history.keys()}:
+            return False
+
+        metadata = self._prune_ai_decision_metadata()
+        existing = metadata['decisions'].get(version) or {}
+        record = {
+            'version': version,
+            'from_version': str(from_version) if from_version is not None else '',
+            'suppressed_by_ai': bool(suppressed_by_ai),
+            'important': bool(decision.get('important', not suppressed_by_ai)),
+            'status': str(decision.get('status') or 'fail_open'),
+            'coverage': str(decision.get('coverage') or 'complete'),
+            'explanation': str(decision.get('explanation', decision.get('summary', '')) or ''),
+            'intent': str(intent or ''),
+            'model': str(decision.get('model') or ''),
+            'prompt_version': str(decision.get('prompt_version') or ''),
+            'evaluated_diff': str(decision.get('evaluated_diff') or ''),
+        }
+        for field in ('feedback', 'feedback_at'):
+            if field in existing:
+                record[field] = existing[field]
+        metadata['decisions'][version] = record
+        metadata['markers'][version] = {
+            'ai_decision': True,
+            'suppressed_by_ai': bool(suppressed_by_ai),
+            'has_evidence': True,
+            'status': record['status'],
+        }
+        self._write_ai_decision_metadata(metadata)
+        self._prune_ai_decision_metadata()
+        return True
+
+    def set_ai_decision_feedback(self, version, feedback):
+        """Set or clear operator feedback for a retained decision."""
+        version = str(version)
+        metadata = self._prune_ai_decision_metadata()
+        record = metadata['decisions'].get(version)
+        if not isinstance(record, dict):
+            return False
+        if feedback is None:
+            record.pop('feedback', None)
+            record.pop('feedback_at', None)
+        else:
+            record['feedback'] = str(feedback)
+            record['feedback_at'] = int(time.time())
+        metadata['decisions'][version] = record
+        self._write_ai_decision_metadata(metadata)
+        return True
 
     # Save some text file to the appropriate path and bump the history
     # result_obj from fetch_site_status.run()
@@ -711,6 +940,7 @@ class model(EntityPersistenceMixin, watch_base):
         logger.trace(f"{self.get('uuid')} - Updating {self.history_index_filename} with timestamp {timestamp}")
 
         self.ensure_data_dir_exists()
+        history_was_empty = not self.history
         skip_brotli = strtobool(os.getenv('DISABLE_BROTLI_TEXT_SNAPSHOT', 'False'))
 
         # Binary data - detect file type and save without compression
@@ -756,6 +986,12 @@ class model(EntityPersistenceMixin, watch_base):
                 snapshot_fname = f"{snapshot_id}.txt"
                 dest = os.path.join(self.data_dir, snapshot_fname)
                 self._write_atomic(dest, contents.encode('utf-8'))
+
+        # Preserve the first snapshot identity separately from the bounded index.
+        # If a legacy index has already been retained without this sidecar, leave
+        # its baseline unknown rather than guessing from the current oldest entry.
+        if history_was_empty:
+            self._write_history_initial_version(timestamp)
 
         # Append to history.txt atomically
         index_fname = os.path.join(self.data_dir, self.history_index_filename)
@@ -1071,31 +1307,57 @@ class model(EntityPersistenceMixin, watch_base):
         import hashlib
         return hashlib.md5(prompt.encode('utf-8', errors='replace')).hexdigest()[:8]
 
-    def get_llm_diff_summary(self, from_version, to_version, prompt: str = '') -> str:
-        """Return the cached AI Change Summary for this from→to + prompt combination, or ''.
+    def _llm_summary_cache_paths(self, from_version, to_version, prompt: str = '') -> tuple[str, str]:
+        prompt_hash = self._llm_summary_prompt_hash(prompt)
+        stem = os.path.join(self.data_dir, f'change-summary-{from_version}-to-{to_version}-{prompt_hash}')
+        return stem + '.txt', stem + '.json'
+
+    def get_llm_diff_summary_result(self, from_version, to_version, prompt: str = '') -> dict | None:
+        """Return cached summary metadata, keyed by version pair and prompt hash.
 
         The prompt hash is embedded in the filename so that a changed prompt
         automatically produces a cache miss and triggers regeneration.
         """
-        prompt_hash = self._llm_summary_prompt_hash(prompt)
-        fname = os.path.join(self.data_dir, f'change-summary-{from_version}-to-{to_version}-{prompt_hash}.txt')
+        fname, metadata_name = self._llm_summary_cache_paths(from_version, to_version, prompt)
+        if os.path.isfile(metadata_name):
+            try:
+                with open(metadata_name, 'r', encoding='utf-8') as f:
+                    result = json.load(f)
+                if isinstance(result, dict) and isinstance(result.get('text'), str):
+                    result['status'] = 'cached'
+                    return result
+            except (OSError, ValueError) as e:
+                logger.warning(f"Could not read LLM summary metadata '{metadata_name}': {e}")
         if not os.path.isfile(fname):
             logger.debug(f"LLM cached diff summary '{fname}' NOT found")
-            return ''
+            return None
         with open(fname, 'r', encoding='utf-8') as f:
             logger.debug(f"LLM cached diff summary '{fname}' FOUND")
-            return f.read().strip()
+            return {'text': f.read().strip(), 'status': 'cached', 'coverage': 'complete'}
 
-    def save_llm_diff_summary(self, summary: str, from_version, to_version, prompt: str = ''):
-        """Persist the AI Change Summary keyed by version pair + prompt hash."""
+    def save_llm_diff_summary(self, summary_result: dict, from_version, to_version, prompt: str = ''):
+        """Persist one structured summary result and bounded metadata."""
         self.ensure_data_dir_exists()
-        prompt_hash = self._llm_summary_prompt_hash(prompt)
-        fname = os.path.join(self.data_dir, f'change-summary-{from_version}-to-{to_version}-{prompt_hash}.txt')
+        if not isinstance(summary_result, dict) or not isinstance(summary_result.get('text'), str):
+            raise TypeError('summary_result must be a structured result with string text')
+        result = dict(summary_result)
+        summary = result['text']
+        fname, metadata_name = self._llm_summary_cache_paths(from_version, to_version, prompt)
         tmp = fname + '.tmp'
+        metadata_tmp = metadata_name + '.tmp'
         try:
             with open(tmp, 'w', encoding='utf-8') as f:
                 f.write(summary)
             os.replace(tmp, fname)
+            with open(metadata_tmp, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'text': summary,
+                    'status': result.get('status', 'ok'),
+                    'coverage': result.get('coverage', 'complete'),
+                    'model': result.get('model', ''),
+                    'prompt_version': result.get('prompt_version', ''),
+                }, f, ensure_ascii=False)
+            os.replace(metadata_tmp, metadata_name)
         except OSError as e:
             logger.warning(f"Could not write LLM summary cache {fname}: {e}")
 

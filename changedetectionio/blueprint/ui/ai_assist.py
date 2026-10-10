@@ -46,6 +46,30 @@ def construct_blueprint(datastore: ChangeDetectionStore):
             logger.exception(f"AI assist '{kind}' failed for {uuid}: {e}")
             return jsonify({'status': 'error', 'error': 'Unexpected error, see the application log.'}), 500
 
+        if kind in ('filters', 'diagnose'):
+            from changedetectionio.processors.text_json_diff import build_combined_filter_preview
+
+            def values(field):
+                return [item.get('value') for item in result.get(field, [])
+                        if isinstance(item, dict) and item.get('value')]
+
+            proposed = {}
+            if kind == 'diagnose' and values('include_filters'):
+                # Diagnosis calls these replacements, so preview the replacement
+                # configuration rather than pretending an append is equivalent.
+                proposed['include_filters'] = values('include_filters')
+            else:
+                for field in ('include_filters', 'subtractive_selectors', 'ignore_text', 'trigger_text'):
+                    proposed[field] = list(dict.fromkeys(
+                        list(watch.get(field) or []) + values(field)
+                    ))
+            result['combined_filter_preview'] = build_combined_filter_preview(
+                datastore,
+                watch,
+                proposed_config=proposed,
+                goal=request.form.get('goal', '')[:2000] or watch.get('llm_intent', ''),
+            )
+
         return jsonify({'status': 'ok', 'kind': kind, **result})
 
     return ai_assist_blueprint

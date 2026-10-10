@@ -46,6 +46,11 @@ def _clean_litellm_error(exc) -> str:
     return first_line or raw.split('\n')[0]
 
 
+def _get_cached_summary_result(watch, from_version, to_version, prompt=''):
+    """Read the structured summary metadata for one version pair."""
+    return watch.get_llm_diff_summary_result(from_version, to_version, prompt=prompt)
+
+
 def construct_blueprint(datastore: ChangeDetectionStore):
     diff_blueprint = Blueprint('ui_diff', __name__, template_folder="../ui/templates")
 
@@ -381,10 +386,15 @@ def construct_blueprint(datastore: ChangeDetectionStore):
         cache_prompt, job_key = ctx['cache_prompt'], ctx['job_key']
 
         # Check cache — keyed by version pair + prompt hash (invalidates if prompt changes)
-        cached = watch.get_llm_diff_summary(from_version, to_version, prompt=cache_prompt)
-        if cached:
+        cached = _get_cached_summary_result(watch, from_version, to_version, prompt=cache_prompt)
+        if cached and cached.get('text'):
+            from changedetectionio.llm.evaluator import record_outcome
+            record_outcome('summary', datastore, watch, status='cached')
             _mark_viewed(uuid)
-            return jsonify({'summary': cached, 'error': None, 'cached': True, 'status': 'done'})
+            return jsonify({
+                'summary': cached['text'], 'error': None, 'cached': True, 'status': 'done',
+                'result_status': 'cached', 'coverage': cached.get('coverage', 'complete'),
+            })
 
         from changedetectionio.llm.summary_jobs import SummaryJobFailed, summary_jobs
 
@@ -437,28 +447,40 @@ def construct_blueprint(datastore: ChangeDetectionStore):
             logger.info(f"AI summary generation started for {uuid} ({from_version}->{to_version}), "
                         f"{len(diff_text)} chars of diff")
             try:
-                summary = summarise_change(watch, datastore, diff=diff_text, current_snapshot=to_text)
+                summary_result = summarise_change(watch, datastore, diff=diff_text, current_snapshot=to_text)
             except LLMInputTooLargeError as e:
                 raise SummaryJobFailed(str(e), http_status=400)
             except Exception as e:
                 logger.error(f"LLM summary generation failed for {uuid}: {e}")
                 raise SummaryJobFailed(_clean_litellm_error(e), http_status=500)
 
-            if not summary:
-                raise SummaryJobFailed('LLM returned empty summary', http_status=200)
+            if not summary_result or not summary_result.get('text'):
+                status = (summary_result or {}).get('status')
+                code = 429 if status == 'budget_exceeded' else 500 if status in (
+                    'fail_open', 'incomplete',
+                ) else 200
+                message = (summary_result or {}).get('error') or 'LLM returned empty summary'
+                if status == 'fail_open':
+                    message = _clean_litellm_error(message)
+                raise SummaryJobFailed(message, http_status=code)
 
             # Persisted before the job is marked done, so a poll can never see "nothing running,
             # nothing cached" and start paying for the same summary a second time.
-            watch.save_llm_diff_summary(summary, from_version, to_version, prompt=cache_prompt)
+            watch.save_llm_diff_summary(summary_result, from_version, to_version, prompt=cache_prompt)
             logger.info(f"AI summary generation finished for {uuid} in "
-                        f"{_time.time() - _started:.1f}s ({len(summary)} chars)")
+                        f"{_time.time() - _started:.1f}s ({len(summary_result['text'])} chars)")
 
         # Re-read the cache. Between the read above and here we have read two snapshots and run
         # difflib, which is long enough for a job started by another tab to have finished and
         # written the summary - and submitting now would pay the LLM for it a second time.
-        cached = watch.get_llm_diff_summary(from_version, to_version, prompt=cache_prompt)
-        if cached:
-            return jsonify({'summary': cached, 'error': None, 'cached': True, 'status': 'done'})
+        cached = _get_cached_summary_result(watch, from_version, to_version, prompt=cache_prompt)
+        if cached and cached.get('text'):
+            from changedetectionio.llm.evaluator import record_outcome
+            record_outcome('summary', datastore, watch, status='cached')
+            return jsonify({
+                'summary': cached['text'], 'error': None, 'cached': True, 'status': 'done',
+                'result_status': 'cached', 'coverage': cached.get('coverage', 'complete'),
+            })
 
         def _announce(_key):
             """Tell any connected browser the job is done so it does not have to poll.
@@ -473,7 +495,18 @@ def construct_blueprint(datastore: ChangeDetectionStore):
                 watch_uuid=uuid, from_version=from_version, to_version=to_version,
             )
 
-        if not summary_jobs.submit(job_key, _job, on_settled=_announce):
+        try:
+            submitted = summary_jobs.submit(job_key, _job, on_settled=_announce)
+        except Exception as e:
+            from changedetectionio.llm.summary_jobs import SummaryQueueFullError
+            if isinstance(e, SummaryQueueFullError):
+                return jsonify({
+                    'summary': None,
+                    'error': 'AI summary queue is full; try again shortly.',
+                    'status': 'error', 'queue_full': True,
+                }), 503
+            raise
+        if not submitted:
             # Another request submitted the same key while we were building the diff. The registry
             # refused ours, so nothing was sent to the LLM twice.
             logger.info(f"AI summary for {uuid} was already started by a concurrent request, "
@@ -501,12 +534,18 @@ def construct_blueprint(datastore: ChangeDetectionStore):
             body, code = err
             return jsonify(body), code
 
-        cached = ctx['watch'].get_llm_diff_summary(
+        cached = _get_cached_summary_result(
+            ctx['watch'],
             ctx['from_version'], ctx['to_version'], prompt=ctx['cache_prompt']
         )
-        if cached:
+        if cached and cached.get('text'):
+            from changedetectionio.llm.evaluator import record_outcome
+            record_outcome('summary', datastore, ctx['watch'], status='cached')
             _mark_viewed(uuid)
-            return jsonify({'summary': cached, 'error': None, 'cached': True, 'status': 'done'})
+            return jsonify({
+                'summary': cached['text'], 'error': None, 'cached': True, 'status': 'done',
+                'result_status': 'cached', 'coverage': cached.get('coverage', 'complete'),
+            })
 
         from changedetectionio.llm.summary_jobs import summary_jobs
 
@@ -521,16 +560,315 @@ def construct_blueprint(datastore: ChangeDetectionStore):
         # Re-read the cache before giving up. The job can finish in the window between the read
         # above and the is_pending check - it writes the summary and *then* clears the flag - so
         # 'idle' here would send the client back to POST for a summary already sitting on disk.
-        cached = ctx['watch'].get_llm_diff_summary(
+        cached = _get_cached_summary_result(
+            ctx['watch'],
             ctx['from_version'], ctx['to_version'], prompt=ctx['cache_prompt']
         )
-        if cached:
+        if cached and cached.get('text'):
+            from changedetectionio.llm.evaluator import record_outcome
+            record_outcome('summary', datastore, ctx['watch'], status='cached')
             _mark_viewed(uuid)
-            return jsonify({'summary': cached, 'error': None, 'cached': True, 'status': 'done'})
+            return jsonify({
+                'summary': cached['text'], 'error': None, 'cached': True, 'status': 'done',
+                'result_status': 'cached', 'coverage': cached.get('coverage', 'complete'),
+            })
 
         # Genuinely nothing: the process restarted mid-generation. Tell the client to start again
         # rather than poll forever.
         return jsonify({'summary': None, 'error': None, 'status': 'idle'})
+
+    def _ai_review_watch(uuid):
+        if uuid == 'first':
+            uuid = next(iter(datastore.data['watching']), None)
+        return datastore.data['watching'].get(uuid), uuid
+
+    @diff_blueprint.route("/diff/<uuid_str:uuid>/ai-review", methods=['GET'])
+    @login_optionally_required
+    def ai_review(uuid):
+        """Render retained AI decisions and the history-linked suppression markers."""
+        watch, uuid = _ai_review_watch(uuid)
+        if not watch:
+            return plaintext_response('Watch not found', 404)
+
+        status = request.args.get('status', 'suppressed')
+        if status not in ('suppressed', 'alerted', 'reviewed', 'all'):
+            return plaintext_response('Invalid review filter', 400)
+
+        decisions = watch.get_ai_history_decisions()
+        markers = watch.get_ai_history_markers()
+        entries = []
+        for version, marker in markers.items():
+            record = decisions.get(version)
+            suppressed = bool(marker.get('suppressed_by_ai'))
+            if status == 'suppressed' and not suppressed:
+                continue
+            if status == 'alerted' and suppressed:
+                continue
+            if status == 'reviewed' and (not record or record.get('feedback') != 'should_alert'):
+                continue
+            entries.append({
+                'version': version,
+                'marker': marker,
+                'record': record,
+            })
+        entries.sort(key=lambda item: int(item['version']) if item['version'].isdigit() else 0, reverse=True)
+
+        retained_versions = set(decisions)
+        older_evidence_count = sum(
+            1 for version, marker in markers.items()
+            if not marker.get('has_evidence') and marker.get('ai_decision')
+        )
+        return render_template(
+            'ai-review.html',
+            entries=entries,
+            filter_status=status,
+            older_evidence_count=older_evidence_count,
+            retained_count=len(retained_versions),
+            retention_count=watch.get_ai_decision_retention(),
+            uuid=uuid,
+            watch=watch,
+        )
+
+    REPLAY_MAX_TRANSITIONS = 20
+    REPLAY_MAX_INTENT_CHARS = 2_000
+
+    def _replay_history_metadata(watch):
+        """Read replay labels without pruning or writing B1 evidence metadata."""
+        try:
+            metadata = watch._read_ai_decision_metadata()
+        except Exception:
+            metadata = {}
+        return metadata if isinstance(metadata, dict) else {}
+
+    def _prepare_replay(watch, raw_versions, proposed_intent):
+        selected = [str(version).strip() for version in raw_versions if str(version).strip()]
+        if not selected:
+            return None, 'Select at least one historical transition.'
+        if len(selected) > REPLAY_MAX_TRANSITIONS:
+            return None, f'Select no more than {REPLAY_MAX_TRANSITIONS} historical transitions.'
+        if len(set(selected)) != len(selected):
+            return None, 'Each historical transition may be selected only once.'
+
+        proposed_intent = (proposed_intent or '').strip()
+        if not proposed_intent:
+            return None, 'Enter a proposed intent before estimating a replay.'
+        if len(proposed_intent) > REPLAY_MAX_INTENT_CHARS:
+            return None, f'Proposed intent must be at most {REPLAY_MAX_INTENT_CHARS:,} characters.'
+
+        history = [str(version) for version in watch.history.keys()]
+        history_set = set(history)
+        missing_versions = [version for version in selected if version not in history_set]
+        if missing_versions:
+            return None, 'One or more selected history versions are no longer retained.'
+
+        from changedetectionio.llm.diff_text import build_llm_diff
+
+        transitions = []
+        unavailable = []
+        for version in history:
+            if version not in selected:
+                continue
+            index = history.index(version)
+            if index == 0:
+                unavailable.append({
+                    'version': version,
+                    'reason': 'No earlier retained snapshot is available for this version.',
+                })
+                continue
+            from_version = history[index - 1]
+            try:
+                previous = watch.get_history_snapshot(timestamp=from_version)
+                current = watch.get_history_snapshot(timestamp=version)
+            except (KeyError, OSError, ValueError) as exc:
+                unavailable.append({
+                    'version': version,
+                    'reason': f'Historical snapshot could not be read: {exc}',
+                })
+                continue
+            transitions.append({
+                'from_version': from_version,
+                'version': version,
+                'diff': build_llm_diff(previous, current),
+                'snapshot': current,
+            })
+
+        return {
+            'selected': selected,
+            'proposed_intent': proposed_intent,
+            'transitions': transitions,
+            'unavailable': unavailable,
+            'history_count': len(history),
+            'retention_count': watch.get_ai_decision_retention(),
+        }, None
+
+    def _replay_estimate(watch, datastore, prepared, current_intent):
+        from changedetectionio.llm.evaluator import estimate_evaluation_request
+
+        intents = [prepared['proposed_intent']]
+        if current_intent and current_intent != prepared['proposed_intent']:
+            intents.insert(0, current_intent)
+        estimates = [
+            estimate_evaluation_request(
+                watch, datastore, transition['diff'], transition['snapshot'], intent,
+            )
+            for transition in prepared['transitions']
+            for intent in intents
+        ]
+        unknown = any(item['estimated_cost_usd'] is None for item in estimates)
+        return {
+            'calls': len(estimates),
+            'input_tokens': sum(item['input_tokens'] for item in estimates),
+            'output_tokens': sum(item['output_tokens'] for item in estimates),
+            'total_tokens': sum(item['total_tokens'] for item in estimates),
+            'estimated_cost_usd': None if unknown else sum(
+                item['estimated_cost_usd'] for item in estimates
+            ),
+            'unknown_cost': unknown,
+            'model': estimates[0]['model'] if estimates else '',
+        }
+
+    @diff_blueprint.route("/diff/<uuid_str:uuid>/ai-replay", methods=['GET', 'POST'])
+    @login_optionally_required
+    def ai_replay(uuid):
+        """Estimate or run a bounded current-versus-proposed intent replay."""
+        watch, uuid = _ai_review_watch(uuid)
+        if not watch:
+            return plaintext_response('Watch not found', 404)
+
+        from changedetectionio.llm.evaluator import resolve_intent
+
+        current_intent = resolve_intent(watch, datastore)[0]
+        raw_versions = request.values.getlist('version')
+        proposed_intent = request.values.get('proposed_intent', '')
+        prepared = None
+        error = None
+        estimate = None
+        results = None
+        if raw_versions or proposed_intent:
+            prepared, error = _prepare_replay(watch, raw_versions, proposed_intent)
+            if prepared and not error:
+                estimate = _replay_estimate(watch, datastore, prepared, current_intent)
+
+                if request.method == 'POST':
+                    from changedetectionio.llm.evaluator import evaluate_change
+
+                    results = []
+                    for transition in prepared['transitions']:
+                        current_result = None
+                        if current_intent:
+                            current_result = evaluate_change(
+                                watch, datastore, transition['diff'], transition['snapshot'],
+                                intent_override=current_intent, persist=False, operation='replay',
+                            )
+                        if current_intent and current_intent == prepared['proposed_intent']:
+                            proposed_result = dict(current_result) if current_result else None
+                        else:
+                            proposed_result = evaluate_change(
+                                watch, datastore, transition['diff'], transition['snapshot'],
+                                intent_override=prepared['proposed_intent'], persist=False,
+                                operation='replay',
+                            )
+                        results.append({
+                            'transition': transition,
+                            'current': current_result,
+                            'proposed': proposed_result,
+                        })
+
+        metadata = _replay_history_metadata(watch)
+        markers = metadata.get('markers') if isinstance(metadata.get('markers'), dict) else {}
+        history_options = [
+            {
+                'version': str(version),
+                'has_previous': index > 0,
+                'suppressed': bool(markers.get(str(version), {}).get('suppressed_by_ai')),
+                'selected': str(version) in set(raw_versions),
+            }
+            for index, version in enumerate(watch.history.keys())
+        ]
+        return render_template(
+            'ai-replay.html',
+            uuid=uuid,
+            watch=watch,
+            history_options=history_options,
+            current_intent=current_intent,
+            proposed_intent=proposed_intent,
+            prepared=prepared,
+            estimate=estimate,
+            results=results,
+            error=error,
+            replay_cap=REPLAY_MAX_TRANSITIONS,
+        ), (400 if error else 200)
+
+    @diff_blueprint.route("/diff/<uuid_str:uuid>/ai-review/<string:version>/feedback", methods=['POST'])
+    @login_optionally_required
+    def ai_review_feedback(uuid, version):
+        """Store explicit operator feedback for one retained AI decision."""
+        from flask import request as flask_request
+
+        watch, uuid = _ai_review_watch(uuid)
+        if not watch:
+            return plaintext_response('Watch not found', 404)
+        if str(version) not in {str(item) for item in watch.history.keys()}:
+            return plaintext_response('Snapshot not found', 404)
+
+        payload = flask_request.get_json(silent=True) or {}
+        feedback = flask_request.form.get('feedback') or payload.get('feedback')
+        if feedback not in ('should_alert', 'clear'):
+            return plaintext_response('Invalid feedback', 400)
+        if not watch.set_ai_decision_feedback(version, None if feedback == 'clear' else feedback):
+            return plaintext_response('AI evidence not retained for this snapshot', 410)
+        return redirect(url_for('ui.ui_diff.ai_review', uuid=uuid, status='suppressed'))
+
+    @diff_blueprint.route("/diff/<uuid_str:uuid>/ai-review/retention", methods=['POST'])
+    @login_optionally_required
+    def ai_review_retention(uuid):
+        """Validate and persist the bounded detailed-decision retention count."""
+        watch, uuid = _ai_review_watch(uuid)
+        if not watch:
+            return plaintext_response('Watch not found', 404)
+        raw_count = request.form.get('retention_count')
+        count = watch.validate_ai_decision_retention(raw_count)
+        if count is None:
+            return plaintext_response('Retention count must be an integer from 1 to 500', 400)
+        watch['llm_ai_decision_retention'] = count
+        watch.commit()
+        watch._prune_ai_decision_metadata()
+        return redirect(url_for('ui.ui_diff.ai_review', uuid=uuid, status='suppressed'))
+
+    @diff_blueprint.route("/diff/<uuid_str:uuid>/ai-review/export", methods=['GET'])
+    @login_optionally_required
+    def ai_review_export(uuid):
+        """Export reviewed examples as deterministic, non-mutating regression fixtures."""
+        import json
+
+        watch, uuid = _ai_review_watch(uuid)
+        if not watch:
+            return plaintext_response('Watch not found', 404)
+        version = request.args.get('version')
+        if version and str(version) not in {str(item) for item in watch.history.keys()}:
+            return plaintext_response('Snapshot not found', 404)
+
+        decisions = watch.get_ai_history_decisions()
+        fixtures = []
+        for decision_version in sorted(decisions, key=lambda item: int(item) if item.isdigit() else 0):
+            if version and decision_version != str(version):
+                continue
+            decision = decisions[decision_version]
+            if decision.get('feedback') != 'should_alert':
+                continue
+            fixtures.append({
+                'fixture_version': 1,
+                'source_version': decision_version,
+                'from_version': decision.get('from_version', ''),
+                'intent': decision.get('intent', ''),
+                'evaluated_diff': decision.get('evaluated_diff', ''),
+                'expected_important': True,
+            })
+
+        response = make_response(json.dumps(fixtures, ensure_ascii=False, indent=2) + '\n')
+        response.headers['Content-Type'] = 'application/json; charset=utf-8'
+        response.headers['Content-Disposition'] = f'attachment; filename="ai-regression-{uuid}.json"'
+        return response
 
     @diff_blueprint.route("/diff/<uuid_str:uuid>/processor-data", methods=['GET'])
     @login_optionally_required

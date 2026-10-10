@@ -5,6 +5,7 @@ import json
 import os
 import re
 import urllib3
+from collections import Counter
 
 from changedetectionio.conditions import execute_ruleset_against_all_plugins
 from changedetectionio.content_fetchers.exceptions import checksumFromPreviousCheckWasTheSame
@@ -175,7 +176,7 @@ class ContentTransformer:
         )
 
     @staticmethod
-    def extract_by_regex(text, regex_patterns):
+    def extract_by_regex(text, regex_patterns, regex_timeout=None):
         """Extract text matching regex patterns."""
         # Use list of strings instead of concatenating lists repeatedly (avoids O(n²) behavior)
         regex_matched_output = []
@@ -184,7 +185,11 @@ class ContentTransformer:
             # Check if it's perl-style regex /.../
             if re.search(PERL_STYLE_REGEX, s_re, re.IGNORECASE):
                 regex = html_tools.perl_style_slash_enclosed_regex_to_options(s_re)
-                result = re.findall(regex, text)
+                if regex_timeout is None:
+                    result = re.findall(regex, text)
+                else:
+                    bounded, timeout = html_tools.compile_bounded_regex(regex, timeout=regex_timeout)
+                    result = bounded.findall(text, timeout=timeout)
 
                 for match in result:
                     if type(match) is tuple:
@@ -209,7 +214,7 @@ class RuleEngine:
     """Evaluates blocking rules (triggers, conditions, text_should_not_be_present)."""
 
     @staticmethod
-    def evaluate_trigger_text(content, trigger_patterns):
+    def evaluate_trigger_text(content, trigger_patterns, regex_timeout=None):
         """
         Check if trigger text is present. If trigger_text is configured,
         content is blocked UNLESS the trigger is found.
@@ -222,13 +227,14 @@ class RuleEngine:
         result = html_tools.strip_ignore_text(
             content=str(content),
             wordlist=trigger_patterns,
-            mode="line numbers"
+            mode="line numbers",
+            regex_timeout=regex_timeout,
         )
         # Unblock if trigger was found
         return not bool(result)
 
     @staticmethod
-    def evaluate_text_should_not_be_present(content, patterns):
+    def evaluate_text_should_not_be_present(content, patterns, regex_timeout=None):
         """
         Check if forbidden text is present. If found, block the change.
         Returns True if blocked, False if allowed.
@@ -239,7 +245,8 @@ class RuleEngine:
         result = html_tools.strip_ignore_text(
             content=str(content),
             wordlist=patterns,
-            mode="line numbers"
+            mode="line numbers",
+            regex_timeout=regex_timeout,
         )
         # Block if forbidden text was found
         return bool(result)
@@ -402,6 +409,131 @@ class ContentProcessor:
         )
 
 
+def render_filter_preview_snapshot(watch, datastore, raw_content, regex_timeout=None):
+    """Run the text processor's filter stages without touching watch persistence.
+
+    Filter repair needs to compare drafts against several saved raw HTML versions.
+    ``run_changedetection`` also maintains checksums and the last pre-filter file,
+    so this bounded seam reuses its FilterConfig, ContentProcessor and transformer
+    stages while keeping the draft strictly ephemeral.
+    """
+    from changedetectionio.content_fetchers.base import Fetcher
+
+    if isinstance(raw_content, bytes):
+        raw_content = raw_content.decode('utf-8', errors='replace')
+    raw_content = str(raw_content or '')
+
+    fetcher = Fetcher()
+    fetcher.content = raw_content
+    fetcher.headers = {'content-type': watch.get('content-type') or DEFAULT_WHEN_NO_CONTENT_TYPE_HEADER}
+    fetcher.screenshot = False
+    fetcher.xpath_data = None
+    filter_config = FilterConfig(watch, datastore)
+    content_processor = ContentProcessor(fetcher, watch, filter_config, datastore)
+    transformer = ContentTransformer()
+
+    ctype_header = fetcher.headers['content-type'].lower()
+    stream_content_type = guess_stream_type(http_content_header=ctype_header, content=raw_content)
+    content = raw_content
+
+    if stream_content_type.is_rss:
+        content = content_processor.preprocess_rss(content)
+        if datastore.data["settings"]["application"].get("rss_reader_mode"):
+            stream_content_type.is_rss = False
+            stream_content_type.is_html = True
+    if stream_content_type.is_pdf:
+        # Saved HTML snapshots are the supported repair input. Preserve an explicit
+        # error for binary/PDF history instead of claiming it was fully evaluated.
+        raise ValueError('Saved raw content is not HTML text.')
+    if stream_content_type.is_json and not filter_config.has_include_json_filters:
+        content = content_processor.preprocess_json(raw_content=content)
+    if stream_content_type.is_html:
+        content = html_tools.workarounds_for_obfuscations(content)
+
+    before_html = content
+    if filter_config.has_subtractive_selectors:
+        content = content_processor.apply_subtractive_selectors(content)
+    if filter_config.has_include_filters:
+        content = content_processor.apply_include_filters(content, stream_content_type)
+
+    if watch.is_source_type_url or stream_content_type.is_plaintext:
+        before_filter = before_html
+        after_filter = content
+    elif stream_content_type.is_html or stream_content_type.is_rss:
+        before_filter = content_processor.extract_text_from_html(before_html, stream_content_type)
+        after_filter = content_processor.extract_text_from_html(content, stream_content_type)
+    else:
+        before_filter = before_html
+        after_filter = content
+
+    if watch.get('trim_text_whitespace'):
+        after_filter = transformer.trim_whitespace(after_filter)
+    if filter_config.extract_lines_containing:
+        after_filter = transformer.extract_lines_containing(after_filter, filter_config.extract_lines_containing)
+    if filter_config.extract_text:
+        after_filter = transformer.extract_by_regex(
+            after_filter, filter_config.extract_text, regex_timeout=regex_timeout
+        )
+    if watch.get('remove_duplicate_lines'):
+        after_filter = transformer.remove_duplicate_lines(after_filter)
+    if watch.get('sort_text_alphabetically'):
+        after_filter = transformer.sort_alphabetically(after_filter)
+
+    ignored_lines = html_tools.strip_ignore_text(
+        after_filter,
+        filter_config.ignore_text,
+        mode='line numbers',
+        regex_timeout=regex_timeout,
+    )
+    checksum_text = html_tools.strip_ignore_text(
+        after_filter,
+        filter_config.ignore_text,
+        regex_timeout=regex_timeout,
+    ) if filter_config.ignore_text else after_filter
+    strip_ignored_lines = watch.get('strip_ignored_lines')
+    if strip_ignored_lines is None:
+        strip_ignored_lines = datastore.data["settings"]["application"].get('strip_ignored_lines')
+    if strip_ignored_lines:
+        after_filter = checksum_text
+
+    trigger_lines = html_tools.strip_ignore_text(
+        after_filter,
+        filter_config.trigger_text,
+        mode='line numbers',
+        regex_timeout=regex_timeout,
+    )
+    blocked_lines = html_tools.strip_ignore_text(
+        after_filter,
+        filter_config.text_should_not_be_present,
+        mode='line numbers',
+        regex_timeout=regex_timeout,
+    )
+
+    before_lines = before_filter.splitlines()
+    retained_lines = after_filter.splitlines()
+    retained_counts = Counter(retained_lines)
+    removed_lines = []
+    for line in before_lines:
+        if retained_counts[line]:
+            retained_counts[line] -= 1
+        else:
+            removed_lines.append(line)
+
+    return {
+        'before_filter': before_filter,
+        'after_filter': after_filter,
+        'retained_content': after_filter,
+        'removed_content': '\n'.join(removed_lines),
+        'ignore_line_numbers': ignored_lines,
+        'trigger_line_numbers': trigger_lines,
+        'blocked_line_numbers': blocked_lines,
+        'trigger_found': not filter_config.trigger_text or bool(trigger_lines),
+        'blocked': bool(blocked_lines) or (bool(filter_config.trigger_text) and not bool(trigger_lines)),
+        'raw_chars': len(before_filter),
+        'retained_chars': len(after_filter),
+    }
+
+
 class ChecksumCalculator:
     """Calculates checksums with various options."""
 
@@ -419,6 +551,8 @@ class perform_site_check(difference_detection_processor):
 
     def run_changedetection(self, watch, force_reprocess=False):
         changed_detected = False
+        regex_timeout = watch.get('_preview_regex_timeout')
+        preview_mode = bool(watch.get('_preview_mode'))
 
         if not watch:
             raise Exception("Watch no longer exists.")
@@ -449,7 +583,7 @@ class perform_site_check(difference_detection_processor):
         rule_engine = RuleEngine()
 
         # Get content type and stream info
-        ctype_header = self.fetcher.get_all_headers().get('content-type', DEFAULT_WHEN_NO_CONTENT_TYPE_HEADER).lower()
+        ctype_header = (self.fetcher.get_all_headers().get('content-type') or DEFAULT_WHEN_NO_CONTENT_TYPE_HEADER).lower()
         stream_content_type = guess_stream_type(http_content_header=ctype_header, content=self.fetcher.content)
 
         # Unset any existing notification error
@@ -463,7 +597,8 @@ class perform_site_check(difference_detection_processor):
         update_obj['content-type'] = ctype_header  # Use hyphen (matches OpenAPI spec and watch_base default)
 
         # Save the raw content checksum to file (processor implementation detail, not watch config)
-        self.update_last_raw_content_checksum(current_raw_document_checksum)
+        if not preview_mode:
+            self.update_last_raw_content_checksum(current_raw_document_checksum)
         update_obj['last_filter_config_hash'] = current_filter_config_hash
 
         # === CONTENT PREPROCESSING ===
@@ -566,7 +701,9 @@ class perform_site_check(difference_detection_processor):
         # lines would incorrectly affect the checksum.
         text_for_checksuming = None
         if filter_config.ignore_text:
-            text_for_checksuming = html_tools.strip_ignore_text(stripped_text, filter_config.ignore_text)
+            text_for_checksuming = html_tools.strip_ignore_text(
+                stripped_text, filter_config.ignore_text, regex_timeout=regex_timeout
+            )
 
         # === LINE FILTER (plain-text substring) ===
         if filter_config.extract_lines_containing:
@@ -576,9 +713,13 @@ class perform_site_check(difference_detection_processor):
 
         # === REGEX EXTRACTION ===
         if filter_config.extract_text:
-            stripped_text = transformer.extract_by_regex(stripped_text, filter_config.extract_text)
+            stripped_text = transformer.extract_by_regex(
+                stripped_text, filter_config.extract_text, regex_timeout=regex_timeout
+            )
             if text_for_checksuming is not None:
-                text_for_checksuming = transformer.extract_by_regex(text_for_checksuming, filter_config.extract_text)
+                text_for_checksuming = transformer.extract_by_regex(
+                    text_for_checksuming, filter_config.extract_text, regex_timeout=regex_timeout
+                )
 
         # === MORE TEXT TRANSFORMATIONS ===
         if watch.get('remove_duplicate_lines'):
@@ -610,11 +751,13 @@ class perform_site_check(difference_detection_processor):
         blocked = False
 
         # Check trigger_text - use text_for_checksuming so ignore_text can suppress trigger_text
-        if rule_engine.evaluate_trigger_text(text_for_checksuming, filter_config.trigger_text):
+        if rule_engine.evaluate_trigger_text(
+                text_for_checksuming, filter_config.trigger_text, regex_timeout=regex_timeout):
             blocked = True
 
         # Check text_should_not_be_present
-        if rule_engine.evaluate_text_should_not_be_present(stripped_text, filter_config.text_should_not_be_present):
+        if rule_engine.evaluate_text_should_not_be_present(
+                stripped_text, filter_config.text_should_not_be_present, regex_timeout=regex_timeout):
             blocked = True
 
         # Check custom conditions
@@ -681,7 +824,8 @@ class perform_site_check(difference_detection_processor):
             include_change_type_prefix=False
         )
 
-        watch.save_last_text_fetched_before_filters(text_before_filter.encode('utf-8'))
+        if not watch.get('_preview_mode'):
+            watch.save_last_text_fetched_before_filters(text_before_filter.encode('utf-8'))
 
         if not rendered_diff and stripped_text:
             # No differences found

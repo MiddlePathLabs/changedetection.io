@@ -79,6 +79,39 @@ def test_content_filter_live_preview(client, live_server, measure_memory_usage, 
     delete_all_watches(client)
 
 
+def test_content_filter_live_preview_defaults_missing_content_type(client, live_server, measure_memory_usage, datastore_path):
+    """A saved watch may have no response content type, so preview uses the HTML default."""
+    set_response(datastore_path=datastore_path)
+    import json
+    import time
+
+    test_url = url_for('test_endpoint', _external=True)
+    datastore = client.application.config.get('DATASTORE')
+    uuid = datastore.add_watch(url=test_url)
+    client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
+    time.sleep(0.5)
+    wait_for_all_checks(client)
+
+    watch = datastore.data['watching'][uuid]
+    watch['content-type'] = None
+    watch.commit()
+
+    res = client.post(
+        url_for("ui.ui_edit.watch_get_preview_rendered", uuid=uuid),
+        data={
+            "include_filters": "",
+            "fetch_backend": 'html_requests',
+            "url": test_url,
+        },
+    )
+    reply = json.loads(res.data.decode('utf-8'))
+
+    assert 'Awesome, you made it' in reply['after_filter']
+    assert 'NoneType' not in reply['after_filter']
+
+    delete_all_watches(client)
+
+
 def _setup_version_list_preview(datastore_path, client):
     """Shared HTML fixture for #4138 preview regressions (version tag list)."""
     import time

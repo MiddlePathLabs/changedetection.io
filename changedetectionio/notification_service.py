@@ -534,6 +534,7 @@ class NotificationService:
             n_object['_llm_result'] = watch.get('_llm_result')
             n_object['_llm_intent'] = watch.get('_llm_intent', '')
             n_object['_llm_change_summary'] = watch.get('_llm_change_summary', '')
+            n_object['_llm_summary_result'] = watch.get('_llm_summary_result')
             self.queue_notification_for_watch(n_object=n_object, watch=watch)
 
         return True

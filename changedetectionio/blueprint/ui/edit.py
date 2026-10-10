@@ -12,6 +12,26 @@ from changedetectionio.time_handler import default_timezone_name, is_within_sche
 from changedetectionio import worker_pool
 from changedetectionio.llm.evaluator import get_llm_config as _get_llm_config
 
+FILTER_REPAIR_FIELDS = (
+    'include_filters', 'subtractive_selectors', 'ignore_text', 'trigger_text',
+    'extract_lines_containing', 'extract_text', 'text_should_not_be_present',
+    'strip_ignored_lines', 'remove_duplicate_lines', 'sort_text_alphabetically',
+    'trim_text_whitespace',
+)
+
+
+def _filter_repair_config(watch, source=None):
+    source = source if source is not None else watch
+    result = {}
+    for field in FILTER_REPAIR_FIELDS:
+        value = source.get(field)
+        if isinstance(value, (list, tuple)):
+            result[field] = list(value)
+        else:
+            result[field] = value
+    return result
+
+
 def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMetaData):
     edit_blueprint = Blueprint('ui_edit', __name__, template_folder="../ui/templates")
 
@@ -210,6 +230,13 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
                 'consecutive_filter_failures': 0,
                 'last_error' : False
             }
+
+            current_filter_config = _filter_repair_config(datastore.data['watching'][uuid])
+            posted_filter_config = _filter_repair_config(
+                datastore.data['watching'][uuid], source=form.data
+            )
+            if posted_filter_config != current_filter_config:
+                extra_update_obj['filter_repair_previous'] = current_filter_config
 
             if request.args.get('unpause_on_save'):
                 extra_update_obj['paused'] = False

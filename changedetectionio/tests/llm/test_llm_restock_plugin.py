@@ -7,6 +7,8 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock
 
+from changedetectionio.llm.client import CompletionResult
+
 
 @pytest.fixture(autouse=True)
 def _clear_llm_result_cache():
@@ -56,7 +58,7 @@ def _call_plugin(content, url='https://example.com/product',
 
     if llm_json is not None:
         with patch('changedetectionio.llm.client.completion',
-                   return_value=(llm_json, 50, 40, 10)):
+                   return_value=CompletionResult(llm_json, 'stop', 50, 40, 10, True)):
             return llm_restock.get_itemprop_availability_override(
                 content=content,
                 fetcher_name='html_requests',
@@ -228,7 +230,10 @@ class TestLLMRestockPluginIntent:
         captured = {}
         def fake_completion(model, messages, api_key, api_base, max_tokens, extra_body=None, timeout=None):
             captured['messages'] = messages
-            return ('{"price": 299.0, "currency": "USD", "availability": "instock"}', 50, 40, 10)
+            return CompletionResult(
+                '{"price": 299.0, "currency": "USD", "availability": "instock"}',
+                'stop', 50, 40, 10, True,
+            )
 
         with patch('changedetectionio.llm.client.completion', side_effect=fake_completion):
             result = llm_restock.get_itemprop_availability_override(
@@ -252,7 +257,10 @@ class TestLLMRestockPluginIntent:
         captured = {}
         def fake_completion(model, messages, api_key, api_base, max_tokens, extra_body=None, timeout=None):
             captured['messages'] = messages
-            return ('{"price": 9.99, "currency": "USD", "availability": "instock"}', 20, 15, 5)
+            return CompletionResult(
+                '{"price": 9.99, "currency": "USD", "availability": "instock"}',
+                'stop', 20, 15, 5, True,
+            )
 
         with patch('changedetectionio.llm.client.completion', side_effect=fake_completion):
             llm_restock.get_itemprop_availability_override(
@@ -274,7 +282,7 @@ class TestLLMRestockPluginErrorHandling:
         llm_restock.datastore = ds
 
         with patch('changedetectionio.llm.client.completion',
-                   return_value=('not valid json at all', 10, 8, 2)):
+                   return_value=CompletionResult('not valid json at all', 'stop', 10, 8, 2, True)):
             result = llm_restock.get_itemprop_availability_override(
                 content='<html><body>$49.99 In Stock</body></html>',
                 fetcher_name='html_requests',

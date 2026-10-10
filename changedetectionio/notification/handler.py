@@ -378,6 +378,9 @@ def process_notification(n_object: NotificationContextData, datastore):
 
     # AI Change Summary: optionally replace {{ diff }} with the AI summary
     _llm_change_summary = (n_object.get('_llm_change_summary') or '').strip()
+    _llm_summary_result = n_object.get('_llm_summary_result') or {}
+    if _llm_change_summary and _llm_summary_result.get('coverage') == 'partial':
+        _llm_change_summary = 'AI summary covers only part of this change.\n\n' + _llm_change_summary
     from changedetectionio.llm.evaluator import get_llm_settings
     _override_diff = get_llm_settings(datastore).override_diff_with_summary
     if _llm_change_summary and _override_diff:

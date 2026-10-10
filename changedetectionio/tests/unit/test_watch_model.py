@@ -280,7 +280,7 @@ class TestFaviconFilenameCache(unittest.TestCase):
 
 
 class TestLLMDiffSummaryCache(unittest.TestCase):
-    """Tests for get_llm_diff_summary / save_llm_diff_summary — version-pair + prompt-hash caching."""
+    """Tests for structured summary persistence — version-pair + prompt-hash caching."""
 
     PROMPT = 'List what changed as bullet points'
 
@@ -292,38 +292,38 @@ class TestLLMDiffSummaryCache(unittest.TestCase):
 
     def test_returns_empty_when_no_file_exists(self):
         watch = self._make_watch()
-        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == ''
+        assert watch.get_llm_diff_summary_result('1000', '2000', prompt=self.PROMPT) is None
 
     def test_save_and_retrieve(self):
         watch = self._make_watch()
-        watch.save_llm_diff_summary('Price dropped to $199', '1000', '2000', prompt=self.PROMPT)
-        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == 'Price dropped to $199'
+        watch.save_llm_diff_summary({'text': 'Price dropped to $199', 'status': 'ok', 'coverage': 'complete'}, '1000', '2000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary_result('1000', '2000', prompt=self.PROMPT)['text'] == 'Price dropped to $199'
 
     def test_different_version_pairs_are_independent(self):
         watch = self._make_watch()
-        watch.save_llm_diff_summary('Summary A', '1000', '2000', prompt=self.PROMPT)
-        watch.save_llm_diff_summary('Summary B', '2000', '3000', prompt=self.PROMPT)
-        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == 'Summary A'
-        assert watch.get_llm_diff_summary('2000', '3000', prompt=self.PROMPT) == 'Summary B'
+        watch.save_llm_diff_summary({'text': 'Summary A', 'status': 'ok', 'coverage': 'complete'}, '1000', '2000', prompt=self.PROMPT)
+        watch.save_llm_diff_summary({'text': 'Summary B', 'status': 'ok', 'coverage': 'complete'}, '2000', '3000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary_result('1000', '2000', prompt=self.PROMPT)['text'] == 'Summary A'
+        assert watch.get_llm_diff_summary_result('2000', '3000', prompt=self.PROMPT)['text'] == 'Summary B'
 
     def test_unknown_pair_returns_empty(self):
         watch = self._make_watch()
-        watch.save_llm_diff_summary('Summary A', '1000', '2000', prompt=self.PROMPT)
-        assert watch.get_llm_diff_summary('9999', '8888', prompt=self.PROMPT) == ''
+        watch.save_llm_diff_summary({'text': 'Summary A', 'status': 'ok', 'coverage': 'complete'}, '1000', '2000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary_result('9999', '8888', prompt=self.PROMPT) is None
 
     def test_changed_prompt_is_a_cache_miss(self):
         """Changing the prompt must invalidate the cached summary for the same version pair."""
         watch = self._make_watch()
-        watch.save_llm_diff_summary('Old summary', '1000', '2000', prompt='original prompt')
+        watch.save_llm_diff_summary({'text': 'Old summary', 'status': 'ok', 'coverage': 'complete'}, '1000', '2000', prompt='original prompt')
         # Different prompt → different hash → different filename → miss
-        assert watch.get_llm_diff_summary('1000', '2000', prompt='new different prompt') == ''
+        assert watch.get_llm_diff_summary_result('1000', '2000', prompt='new different prompt') is None
 
     def test_file_named_by_versions_and_prompt_hash(self):
         """Cache file must be named change-summary-{from}-to-{to}-{hash}.txt."""
         import hashlib
         watch = self._make_watch()
         prompt = 'my summary prompt'
-        watch.save_llm_diff_summary('Test summary', '1776000000', '1776001000', prompt=prompt)
+        watch.save_llm_diff_summary({'text': 'Test summary', 'status': 'ok', 'coverage': 'complete'}, '1776000000', '1776001000', prompt=prompt)
         prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:8]
         expected_path = os.path.join(
             watch.data_dir,
@@ -336,9 +336,9 @@ class TestLLMDiffSummaryCache(unittest.TestCase):
 
     def test_overwrite_same_pair_and_prompt(self):
         watch = self._make_watch()
-        watch.save_llm_diff_summary('First summary', '1000', '2000', prompt=self.PROMPT)
-        watch.save_llm_diff_summary('Updated summary', '1000', '2000', prompt=self.PROMPT)
-        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == 'Updated summary'
+        watch.save_llm_diff_summary({'text': 'First summary', 'status': 'ok', 'coverage': 'complete'}, '1000', '2000', prompt=self.PROMPT)
+        watch.save_llm_diff_summary({'text': 'Updated summary', 'status': 'ok', 'coverage': 'complete'}, '1000', '2000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary_result('1000', '2000', prompt=self.PROMPT)['text'] == 'Updated summary'
 
 
 class TestHistoryPathTraversal(unittest.TestCase):

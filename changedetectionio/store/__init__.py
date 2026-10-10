@@ -585,7 +585,7 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
     def unread_changes_count(self):
         unread_changes_count = 0
         for uuid, watch in self.__data['watching'].items():
-            if watch.history_n >= 2 and watch.viewed == False:
+            if watch.has_unviewed:
                 unread_changes_count += 1
 
         return unread_changes_count

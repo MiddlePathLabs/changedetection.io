@@ -320,6 +320,9 @@
       </label>
       {% endfor %}
     </div>
+    <span class="pure-form-message-inline">
+      {{ _('Evaluation and summaries count toward both the global and per-watch limits. Preview, restock extraction, setup assistance, and connection tests count only toward the global limit. These are soft limits: concurrent checks can overshoot by a small bounded amount.') }}
+    </span>
   </div>
 
   <div class="pure-control-group">
@@ -346,7 +349,7 @@
   {% call stab_pane('usage') %}
   <p class="stab-section-title">{{ _('Token & Cost Tracking') }}</p>
 
-  {% if llm_stored.get('tokens_total_cumulative') or llm_stored.get('tokens_this_month') %}
+  {% if llm_stored.get('tokens_total_cumulative') or llm_stored.get('tokens_this_month') or llm_has_metrics %}
 
   <div class="llm-usage-grid">
     <div class="llm-stat-card">
@@ -410,13 +413,75 @@
       <span class="llm-usage-row-label">{{ _('Max tokens per watch per period') }}</span>
       <span class="llm-usage-row-value">
         {{ form.llm.form.max_tokens_per_count_period(placeholder=_('0 = unlimited'), value=llm_stored.get('max_tokens_per_count_period', 0) or '') }}
-        <span class="llm-field-hint">{{ _('tokens — skips AI evaluation on a watch once its usage within the current period (monthly) hits this cap (0 = unlimited)') }}</span>
+        <span class="llm-field-hint">{{ _('tokens — skips AI evaluation and summaries on a watch once its usage within the current period (monthly) hits this cap (0 = unlimited)') }}</span>
       </span>
     </div>
   </div>
 
+  <p class="stab-section-title">{{ _('Usage by operation') }}</p>
+  <p class="pure-form-message-inline">
+    {{ _('Counters begin when AI usage tracking became available; earlier operations cannot be reconstructed. A provider that does not report usage, or a model without bundled pricing, is shown as Unknown rather than zero.') }}
+  </p>
+  <div class="llm-usage-table-wrap">
+    <table class="pure-table pure-table-horizontal llm-usage-table">
+      <thead><tr>
+        <th scope="col">{{ _('Operation') }}</th>
+        <th scope="col">{{ _('Calls') }}</th>
+        <th scope="col">{{ _('Input / output / total tokens') }}</th>
+        <th scope="col">{{ _('Estimated cost') }}</th>
+        <th scope="col">{{ _('Cache hit rate') }}</th>
+        <th scope="col">{{ _('Outcomes') }}</th>
+      </tr></thead>
+      <tbody>
+      {% for operation, metrics in llm_operation_metrics.items() %}
+      <tr>
+        <th scope="row">{{ operation|replace('_', ' ')|title }}</th>
+        <td>{{ '{:,}'.format(metrics.dispatched_calls) }}</td>
+        <td>{% if metrics.unknown_usage %}{{ _('Unknown') }}{% else %}{{ '{:,}'.format(metrics.input_tokens) }} / {{ '{:,}'.format(metrics.output_tokens) }} / {{ '{:,}'.format(metrics.tokens) }}{% endif %}</td>
+        <td>{% if metrics.unknown_cost or metrics.unknown_usage %}{{ _('Unknown') }}{% elif llm_show_costs %}${{ '%.4f'|format(metrics.estimated_cost_usd) }}{% else %}{{ _('Not shown') }}{% endif %}</td>
+        <td>{% if metrics.cache_lookups %}{{ _('%(hits)s of %(lookups)s (%(rate)s%%)', hits='{:,}'.format(metrics.cache_hits), lookups='{:,}'.format(metrics.cache_lookups), rate='%.1f'|format(metrics.cache_hits / metrics.cache_lookups * 100)) }}{% else %}{{ _('Not applicable — no cache lookups recorded') }}{% endif %}</td>
+        <td>{{ _('fail-open: %(count)s; budget skips: %(skips)s; incomplete: %(incomplete)s; cache hits: %(hits)s', count=metrics.fail_open, skips=metrics.budget_skips, incomplete=metrics.incomplete, hits=metrics.cache_hits) }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if llm_watch_metrics %}
+  <p class="stab-section-title">{{ _('Usage by watch') }}</p>
+  <div class="llm-usage-table-wrap">
+    <table class="pure-table pure-table-horizontal llm-usage-table">
+      <thead><tr>
+        <th scope="col">{{ _('Watch') }}</th>
+        <th scope="col">{{ _('Input / output / total tokens') }}</th>
+        <th scope="col">{{ _('Estimated cost') }}</th>
+        <th scope="col">{{ _('Fail-open calls') }}</th>
+        <th scope="col">{{ _('Review') }}</th>
+      </tr></thead>
+      <tbody>
+      {% for item in llm_watch_metrics[:20] %}
+      <tr>
+        <th scope="row">{{ item.label }}</th>
+        <td>{% if item.metrics.values()|selectattr('unknown_usage')|list|length %}{{ _('Unknown') }}{% else %}{{ '{:,}'.format(item.metrics.values()|sum(attribute='input_tokens')) }} / {{ '{:,}'.format(item.metrics.values()|sum(attribute='output_tokens')) }} / {{ '{:,}'.format(item.tokens) }}{% endif %}</td>
+        <td>{% set watch_unknown = item.metrics.values()|selectattr('unknown_cost')|list|length or item.metrics.values()|selectattr('unknown_usage')|list|length %}{% if watch_unknown %}{{ _('Unknown') }}{% elif llm_show_costs %}${{ '%.4f'|format(item.cost) }}{% else %}{{ _('Not shown') }}{% endif %}</td>
+        <td>{{ item.fail_open }}</td>
+        <td><a href="{{ url_for('ui.ui_diff.ai_review', uuid=item.uuid) }}">{{ _('Open AI review') }}</a></td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <p class="pure-form-message-inline">
+    {{ _('Cache hit rate is live evaluation cache hits divided by recorded evaluation cache lookups. Operations without a lookup denominator are shown as not applicable.') }}
+  </p>
+  <p class="pure-form-message-inline">
+    {{ _('Live evaluation and summary calls count toward the global and per-watch budgets. Preview, restock extraction, setup assistance, connection tests, and intent replay count only toward the global budget. These are soft limits, so one active call per worker can overshoot a boundary. Latency, retry, and queue-saturation analytics are not recorded unless a future version exposes them.') }}
+  </p>
+
   {% else %}
-  <p class="llm-no-usage">{{ _('No AI usage recorded yet.') }}</p>
+  <p class="llm-no-usage">{{ _('No AI usage recorded yet. Counters begin when AI usage tracking became available; earlier operations cannot be reconstructed.') }}</p>
 
   <div class="llm-usage-settings">
     <div class="llm-usage-row">

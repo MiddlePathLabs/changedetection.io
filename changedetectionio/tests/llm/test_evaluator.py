@@ -6,6 +6,16 @@ Uses mocked LLM calls — no real API key needed.
 import pytest
 from unittest.mock import patch, MagicMock
 
+from changedetectionio.llm.client import CompletionResult
+
+
+def _completion(text, total, input_tokens=0, output_tokens=0, finish_reason='stop'):
+    return CompletionResult(
+        text=text, total_tokens=total, input_tokens=input_tokens,
+        output_tokens=output_tokens, finish_reason=finish_reason,
+        usage_reported=bool(input_tokens or output_tokens or total),
+    )
+
 
 def _make_datastore(llm_cfg=None, tags=None):
     """Build a minimal datastore-like dict for testing."""
@@ -300,14 +310,16 @@ class TestEvaluateChange:
         ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini'})
         watch = _make_watch(llm_intent='flag price drops')
         result = evaluate_change(watch, ds, diff='')
-        assert result == {'important': False, 'summary': ''}
+        assert result['important'] is False
+        assert result['status'] == 'ok'
 
     def test_returns_not_important_for_whitespace_diff(self):
         from changedetectionio.llm.evaluator import evaluate_change
         ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini'})
         watch = _make_watch(llm_intent='flag price drops')
         result = evaluate_change(watch, ds, diff='   \n  ')
-        assert result == {'important': False, 'summary': ''}
+        assert result['important'] is False
+        assert result['status'] == 'ok'
 
     def test_calls_llm_and_returns_result(self):
         from changedetectionio.llm.evaluator import evaluate_change
@@ -316,7 +328,7 @@ class TestEvaluateChange:
         watch = _make_watch(llm_intent='flag price drops')
 
         llm_response = '{"important": true, "summary": "Price dropped from $500 to $400"}'
-        with patch('changedetectionio.llm.client.completion', return_value=(llm_response, 150)):
+        with patch('changedetectionio.llm.client.completion', return_value=_completion(llm_response, 150)):
             result = evaluate_change(watch, ds, diff='- $500\n+ $400')
 
         assert result['important'] is True
@@ -361,7 +373,7 @@ class TestEvaluateChange:
         watch = _make_watch(llm_intent='only alert on price drops')
 
         llm_response = '{"important": false, "summary": "Only a footer copyright year changed"}'
-        with patch('changedetectionio.llm.client.completion', return_value=(llm_response, 45)):
+        with patch('changedetectionio.llm.client.completion', return_value=_completion(llm_response, 45)):
             result = evaluate_change(watch, ds, diff='- Copyright 2023\n+ Copyright 2024')
 
         assert result['important'] is False
@@ -375,7 +387,7 @@ class TestEvaluateChange:
         watch = _make_watch(llm_intent='flag price drops')
 
         llm_response = '{"important": true, "summary": "Price fell"}'
-        with patch('changedetectionio.llm.client.completion', return_value=(llm_response, 123)):
+        with patch('changedetectionio.llm.client.completion', return_value=_completion(llm_response, 123)):
             evaluate_change(watch, ds, diff='- $500\n+ $300')
 
         assert watch.get('llm_last_tokens_used') == 123
@@ -390,11 +402,11 @@ class TestEvaluateChange:
         resp1 = '{"important": true, "summary": "First"}'
         resp2 = '{"important": false, "summary": "Second"}'
 
-        with patch('changedetectionio.llm.client.completion', return_value=(resp1, 80)):
+        with patch('changedetectionio.llm.client.completion', return_value=_completion(resp1, 80)):
             evaluate_change(watch, ds, diff='- $500\n+ $400')
 
         # Second call needs a different diff to avoid cache hit
-        with patch('changedetectionio.llm.client.completion', return_value=(resp2, 60)):
+        with patch('changedetectionio.llm.client.completion', return_value=_completion(resp2, 60)):
             evaluate_change(watch, ds, diff='- $400\n+ $350')
 
         assert watch.get('llm_tokens_used_cumulative') == 140
@@ -407,7 +419,7 @@ class TestEvaluateChange:
         ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini'})
         watch = _make_watch(llm_intent='flag price drops')
 
-        with patch('changedetectionio.llm.client.completion', return_value=('', 400)):
+        with patch('changedetectionio.llm.client.completion', return_value=_completion('', 400)):
             result = evaluate_change(watch, ds, diff='- $500\n+ $400')
 
         assert result['important'] is True
@@ -417,7 +429,7 @@ class TestEvaluateChange:
 
         # A later good reply for the same diff is evaluated, not served from a bad cache.
         good = '{"important": false, "summary": "no drop"}'
-        with patch('changedetectionio.llm.client.completion', return_value=(good, 50)) as m:
+        with patch('changedetectionio.llm.client.completion', return_value=_completion(good, 50)) as m:
             result = evaluate_change(watch, ds, diff='- $500\n+ $400')
             m.assert_called_once()
         assert result['important'] is False
@@ -428,11 +440,11 @@ class TestEvaluateChange:
         ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini'})
         watch = _make_watch(llm_intent='flag price drops')
         resp = '{"important": true, "summary": "x"}'
-        with patch('changedetectionio.llm.client.completion', return_value=(resp, 10)):
+        with patch('changedetectionio.llm.client.completion', return_value=_completion(resp, 10)):
             evaluate_change(watch, ds, diff='- $500\n+ $400')
 
         ds.data['settings']['application']['llm']['model'] = 'gpt-4.1'
-        with patch('changedetectionio.llm.client.completion', return_value=(resp, 10)) as m:
+        with patch('changedetectionio.llm.client.completion', return_value=_completion(resp, 10)) as m:
             evaluate_change(watch, ds, diff='- $500\n+ $400')
             m.assert_called_once()
 
@@ -442,7 +454,7 @@ class TestEvaluateChange:
         ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini'})
         watch = _make_watch(llm_intent='flag price drops')
         resp = '{"important": true, "summary": "x"}'
-        with patch('changedetectionio.llm.client.completion', return_value=(resp, 1)):
+        with patch('changedetectionio.llm.client.completion', return_value=_completion(resp, 1)):
             for i in range(EVAL_CACHE_MAX_ENTRIES + 10):
                 evaluate_change(watch, ds, diff=f'- ${i}\n+ ${i + 1}')
         assert len(watch['llm_evaluation_cache']) == EVAL_CACHE_MAX_ENTRIES
@@ -455,7 +467,7 @@ class TestEvaluateChange:
         watch = _make_watch(llm_intent='flag price drops')
         diff = '\n'.join([' unchanged context line'] * 100 + ['- $500', '+ $400'])
         resp = '{"important": true, "summary": "dropped"}'
-        with patch('changedetectionio.llm.client.completion', return_value=(resp, 10)) as m:
+        with patch('changedetectionio.llm.client.completion', return_value=_completion(resp, 10)) as m:
             result = evaluate_change(watch, ds, diff=diff)
         assert result['important'] is True
         sent = m.call_args.kwargs['messages'][1]['content']
@@ -598,7 +610,8 @@ class TestTokenBudget:
             mock_llm.assert_not_called()
 
         # Fail open: important=True so the notification is NOT suppressed
-        assert result == {'important': True, 'summary': ''}
+        assert result['important'] is True
+        assert result['status'] in ('budget_exceeded', 'fail_open')
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +665,7 @@ class TestSummariseChange:
         ds = _make_datastore(llm_cfg={})
         watch = _make_watch(llm_change_summary='List what changed')
         result = summarise_change(watch, ds, diff='- old\n+ new')
-        assert result == ''
+        assert result is None
 
     def test_uses_default_prompt_when_no_summary_prompt(self):
         """When llm_change_summary is empty, falls back to DEFAULT_CHANGE_SUMMARY_PROMPT."""
@@ -660,14 +673,16 @@ class TestSummariseChange:
         ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini', 'api_key': 'sk-test'})
         watch = _make_watch(llm_change_summary='')
         with patch('changedetectionio.llm.client.completion',
-                   return_value=('A new item was added.', 40)) as mock_llm:
+                   return_value=_completion('A new item was added.', 40)) as mock_llm:
             result = summarise_change(watch, ds, diff='- old\n+ new')
         mock_llm.assert_called_once()
         # Default prompt must appear in the user message
         call_messages = mock_llm.call_args.kwargs['messages']
         user_msg = next(m['content'] for m in call_messages if m['role'] == 'user')
         assert DEFAULT_CHANGE_SUMMARY_PROMPT in user_msg
-        assert result == 'A new item was added.'
+        assert result['text'] == 'A new item was added.'
+        assert result['status'] == 'ok'
+        assert result['coverage'] == 'complete'
 
     def test_returns_empty_when_diff_empty(self):
         from changedetectionio.llm.evaluator import summarise_change
@@ -676,17 +691,18 @@ class TestSummariseChange:
         with patch('changedetectionio.llm.client.completion') as mock_llm:
             result = summarise_change(watch, ds, diff='')
             mock_llm.assert_not_called()
-        assert result == ''
+        assert result['text'] == ''
+        assert result['status'] == 'ok'
 
     def test_calls_llm_and_returns_plain_text(self):
         from changedetectionio.llm.evaluator import summarise_change
         ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini', 'api_key': 'sk-test'})
         watch = _make_watch(llm_change_summary='List new events in English')
         with patch('changedetectionio.llm.client.completion',
-                   return_value=('3 new events added: Jazz Night, Art Show, Comedy Gig', 80)):
+                   return_value=_completion('3 new events added: Jazz Night, Art Show, Comedy Gig', 80)):
             result = summarise_change(watch, ds, diff='+ Jazz Night\n+ Art Show\n+ Comedy Gig')
-        assert 'Jazz Night' in result
-        assert 'Art Show' in result
+        assert 'Jazz Night' in result['text']
+        assert 'Art Show' in result['text']
 
     def test_cascades_from_tag(self):
         """llm_change_summary on a tag propagates to watches in that tag."""
@@ -695,18 +711,18 @@ class TestSummariseChange:
         ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini'}, tags={'tag-1': tag})
         watch = _make_watch(llm_change_summary='', tags=['tag-1'])
         with patch('changedetectionio.llm.client.completion',
-                   return_value=('New concert added on Friday', 60)):
+                   return_value=_completion('New concert added on Friday', 60)):
             result = summarise_change(watch, ds, diff='+ Konzert am Freitag')
-        assert result == 'New concert added on Friday'
+        assert result['text'] == 'New concert added on Friday'
 
-    def test_llm_failure_raises(self):
-        """On LLM error, summarise_change re-raises so callers can surface the error."""
+    def test_llm_failure_returns_fail_open_result(self):
+        """Provider errors are explicit fail-open results for worker/UI consumers."""
         from changedetectionio.llm.evaluator import summarise_change
         ds = _make_datastore(llm_cfg={'model': 'gpt-4o-mini'})
         watch = _make_watch(llm_change_summary='Describe the change')
         with patch('changedetectionio.llm.client.completion', side_effect=Exception('timeout')):
-            with pytest.raises(Exception, match='timeout'):
-                summarise_change(watch, ds, diff='- old\n+ new')
+            result = summarise_change(watch, ds, diff='- old\n+ new')
+        assert result['status'] == 'fail_open'
 
     def test_uses_higher_token_limit_than_eval(self):
         """summarise_change passes a dynamic max_tokens larger than the eval default (200)."""
@@ -715,7 +731,7 @@ class TestSummariseChange:
         watch = _make_watch(llm_change_summary='Describe changes')
         diff = '- old\n+ new'
         with patch('changedetectionio.llm.client.completion',
-                   return_value=('Some summary', 100)) as mock_llm:
+                   return_value=_completion('Some summary', 100)) as mock_llm:
             summarise_change(watch, ds, diff=diff)
         call_kwargs = mock_llm.call_args
         passed_max_tokens = call_kwargs.kwargs.get('max_tokens')

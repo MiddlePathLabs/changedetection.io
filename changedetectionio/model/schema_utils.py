@@ -25,10 +25,13 @@ SYSTEM_MANAGED_NON_SPEC_FIELDS = frozenset({
     '_llm_result',                 # LLM runtime — populated by evaluator
     '_llm_intent',
     '_llm_change_summary',
+    '_llm_summary_result',
     'llm_prefilter',
     'llm_evaluation_cache',
     'llm_last_tokens_used',
     'llm_tokens_used_cumulative',
+    'llm_metrics',
+    'llm_ai_decision_retention',
     'diff_display_prefs',          # Per-watch history/diff view filter preferences
     'consecutive_check_failures',
     'check_failure_alerted',

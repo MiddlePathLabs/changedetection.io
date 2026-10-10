@@ -269,6 +269,7 @@ def render(watch, datastore, request, url_for, render_template, flash, redirect,
     # Load cached AI diff summary for this exact from→to + prompt combination
     viewing_latest = diff_versions.viewing_latest
     llm_diff_summary = ''
+    llm_diff_summary_coverage = 'complete'
     llm_summary_prompt = ''
     if llm_configured:
         try:
@@ -288,7 +289,10 @@ def render(watch, datastore, request, url_for, render_template, flash, redirect,
                 max_summary_tokens=_max_summary_tokens,
                 model=_llm_model,
             )
-            llm_diff_summary = watch.get_llm_diff_summary(from_version, to_version, prompt=_cache_prompt)
+            _summary_result = watch.get_llm_diff_summary_result(from_version, to_version, prompt=_cache_prompt)
+            if _summary_result:
+                llm_diff_summary = _summary_result.get('text', '')
+                llm_diff_summary_coverage = _summary_result.get('coverage', 'complete')
         except Exception as e:
             logger.warning(f"Could not load llm-diff-summary for {uuid}: {e}")
 
@@ -320,7 +324,8 @@ def render(watch, datastore, request, url_for, render_template, flash, redirect,
                              versions=dates,  # All except current/last
                              watch_a=watch,
                              llm_configured=llm_configured,
-                             llm_diff_summary=llm_diff_summary,
+                              llm_diff_summary=llm_diff_summary,
+                              llm_diff_summary_coverage=llm_diff_summary_coverage,
                              llm_summary_prompt=llm_summary_prompt,
                              viewing_latest=viewing_latest,
                              )

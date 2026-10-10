@@ -33,14 +33,14 @@ class TestGeminiFlashLiteClientHandling(unittest.TestCase):
     def test_flash_lite_model_omits_temperature_initially(self):
         mock_resp = self._mock_success_response()
         with patch("litellm.completion", return_value=mock_resp) as mock_call:
-            text, total_tok, in_tok, out_tok = m.completion(
+            result = m.completion(
                 model="gemini/gemini-2.0-flash-lite",
                 messages=[{"role": "user", "content": "hi"}],
             )
-            self.assertEqual(text, "test response")
-            self.assertEqual(total_tok, 50)
-            self.assertEqual(in_tok, 30)
-            self.assertEqual(out_tok, 20)
+            self.assertEqual(result.text, "test response")
+            self.assertEqual(result.total_tokens, 50)
+            self.assertEqual(result.input_tokens, 30)
+            self.assertEqual(result.output_tokens, 20)
 
         kwargs = mock_call.call_args.kwargs
         self.assertNotIn("temperature", kwargs)
@@ -59,12 +59,12 @@ class TestGeminiFlashLiteClientHandling(unittest.TestCase):
         exc = self._bad_request()
         mock_resp = self._mock_success_response()
         with patch("litellm.completion", side_effect=[exc, mock_resp]) as mock_call:
-            text, total_tok, in_tok, out_tok = m.completion(
+            result = m.completion(
                 model="gemini/gemini-2.5-flash",
                 messages=[{"role": "user", "content": "hi"}],
                 extra_body={"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}},
             )
-            self.assertEqual(text, "test response")
+            self.assertEqual(result.text, "test response")
             self.assertEqual(mock_call.call_count, 2)
 
             first_call_kwargs = mock_call.call_args_list[0].kwargs

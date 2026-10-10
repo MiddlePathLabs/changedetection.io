@@ -9,7 +9,7 @@
      data-url="{{ url_for('ui.ui_ai_assist.watch_ai_assist', uuid=uuid, kind='__KIND__') }}">
     <h3 style="margin-top:0">&#x2728; {{ _('AI setup assistant') }}</h3>
     <p class="pure-form-message-inline" style="margin-top:0">
-        {{ _('Each button asks the AI once, using the saved page and history. Suggestions are checked against the real page first, and are only added to the form when you choose. Nothing changes until you press Save.') }}
+        {{ _('Each button asks the AI once, using the saved page and history. Suggestions are checked against the real page first, and are only added to the draft form when you choose. The combined before/after preview is shown in Filters & Triggers; nothing changes until you press Save.') }}
     </p>
 
     {% if watch.get('last_error') or watch.get('consecutive_filter_failures') or watch.get('browser_steps_last_error_step') %}

@@ -20,6 +20,7 @@ from unittest.mock import patch
 from flask import url_for
 
 from changedetectionio.tests.util import wait_for_all_checks, delete_all_watches
+from changedetectionio.llm.client import CompletionResult
 
 
 HTML_WITH_ARTICLES = """<html><body>
@@ -77,7 +78,7 @@ def test_preview_returns_llm_answer_for_article_intent(
     _configure_llm(client)
 
     llm_json = '{"found": true, "answer": "3 articles are listed in the content"}'
-    with patch('changedetectionio.llm.client.completion', return_value=(llm_json, 50)):
+    with patch('changedetectionio.llm.client.completion', return_value=CompletionResult(llm_json, 'stop', 50, 40, 10, True)):
         res = client.post(
             url_for("ui.ui_edit.watch_get_preview_rendered", uuid=uuid),
             data={
@@ -111,7 +112,7 @@ def test_preview_returns_llm_answer_for_price_intent(
     _configure_llm(client)
 
     llm_json = '{"found": true, "answer": "Price $149, 25% off (was $199)"}'
-    with patch('changedetectionio.llm.client.completion', return_value=(llm_json, 60)):
+    with patch('changedetectionio.llm.client.completion', return_value=CompletionResult(llm_json, 'stop', 60, 50, 10, True)):
         res = client.post(
             url_for("ui.ui_edit.watch_get_preview_rendered", uuid=uuid),
             data={
@@ -137,7 +138,7 @@ def test_preview_found_false_when_content_not_relevant(
     _configure_llm(client)
 
     llm_json = '{"found": false, "answer": "No price information found on this page"}'
-    with patch('changedetectionio.llm.client.completion', return_value=(llm_json, 45)):
+    with patch('changedetectionio.llm.client.completion', return_value=CompletionResult(llm_json, 'stop', 45, 35, 10, True)):
         res = client.post(
             url_for("ui.ui_edit.watch_get_preview_rendered", uuid=uuid),
             data={

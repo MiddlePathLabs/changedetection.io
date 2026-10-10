@@ -33,8 +33,8 @@ class TestTransientRetries(unittest.TestCase):
         exc = litellm.RateLimitError(message='429', llm_provider='openai', model='gpt-4o-mini',
                                      response=_http_response(429))
         with patch('litellm.completion', side_effect=[exc, _resp('done')]) as call:
-            text, *_ = m.completion(model='gpt-4o-mini', messages=MSGS)
-        self.assertEqual(text, 'done')
+            result = m.completion(model='gpt-4o-mini', messages=MSGS)
+        self.assertEqual(result.text, 'done')
         self.assertEqual(call.call_count, 2)
         sleep.assert_called_once()
 
@@ -49,8 +49,8 @@ class TestTransientRetries(unittest.TestCase):
         exc = litellm.ServiceUnavailableError(message='overloaded', llm_provider='anthropic',
                                               model='claude-sonnet-4-5', response=_http_response(503))
         with patch('litellm.completion', side_effect=[exc, exc, _resp('third time')]) as call:
-            text, *_ = m.completion(model='claude-sonnet-4-5', messages=MSGS)
-        self.assertEqual(text, 'third time')
+            result = m.completion(model='claude-sonnet-4-5', messages=MSGS)
+        self.assertEqual(result.text, 'third time')
         self.assertEqual(call.call_count, 3)
 
     def test_gives_up_after_default_retries(self, sleep):
@@ -84,24 +84,24 @@ class TestEmptyLengthRetry(unittest.TestCase):
             _resp('', finish='length', total=500, prompt=100, completion=400),
             _resp('{"important": true}', total=900, prompt=100, completion=800),
         ]) as call:
-            text, total, tin, tout = m.completion(model='deepseek/deepseek-reasoner', messages=MSGS,
-                                                  max_tokens=400)
-        self.assertEqual(text, '{"important": true}')
+            result = m.completion(model='deepseek/deepseek-reasoner', messages=MSGS,
+                                  max_tokens=400)
+        self.assertEqual(result.text, '{"important": true}')
         self.assertEqual(call.call_count, 2)
         self.assertGreater(call.call_args_list[1].kwargs['max_tokens'], 400)
         # Both calls were billed.
-        self.assertEqual((total, tin, tout), (1400, 200, 1200))
+        self.assertEqual((result.total_tokens, result.input_tokens, result.output_tokens), (1400, 200, 1200))
 
     def test_only_retried_once(self):
         with patch('litellm.completion', return_value=_resp('', finish='length')) as call:
-            text, *_ = m.completion(model='x', messages=MSGS, max_tokens=400)
-        self.assertEqual(text, '')
+            result = m.completion(model='x', messages=MSGS, max_tokens=400)
+        self.assertEqual(result.text, '')
         self.assertEqual(call.call_count, 2)
 
     def test_non_empty_truncated_reply_is_returned_as_is(self):
         with patch('litellm.completion', return_value=_resp('partial', finish='length')) as call:
-            text, *_ = m.completion(model='x', messages=MSGS)
-        self.assertEqual(text, 'partial')
+            result = m.completion(model='x', messages=MSGS)
+        self.assertEqual(result.text, 'partial')
         self.assertEqual(call.call_count, 1)
 
 

@@ -26,6 +26,7 @@ from . import client as llm_client
 from .bm25_trim import trim_to_relevant
 from .diff_text import build_llm_diff
 from .response_parser import parse_json_object
+from .prompt_builder import PROMPT_VERSION
 
 # Page outline sent to the model. Big enough for a real product/listing page after
 # scripts, styles and attribute noise are stripped; trimmed by relevance past that.
@@ -62,22 +63,23 @@ def _call_json(datastore, system_prompt: str, user_prompt: str) -> dict:
         _cached_system,
         _runtime_llm_config,
         _thinking_extra_body,
-        accumulate_global_tokens,
         apply_local_token_multiplier,
         get_llm_settings,
-        is_global_token_budget_exceeded,
+        admit,
+        record_outcome,
+        record_usage,
         resolve_llm_timeout,
     )
 
     cfg = _runtime_llm_config(datastore)
     if not cfg:
         raise AssistError('AI / LLM is not configured, or is switched off in settings.')
-    if is_global_token_budget_exceeded(datastore):
+    if not admit('setup', None, datastore, cfg=cfg):
         raise AssistError('Monthly AI token budget reached. Resets next month.', http_status=429)
 
     settings = get_llm_settings(datastore)
     try:
-        raw, tokens, input_tokens, output_tokens = (tuple(llm_client.completion(
+        completion_result = llm_client.completion(
             model=cfg['model'],
             messages=[
                 _cached_system(system_prompt, model=cfg['model']),
@@ -89,18 +91,26 @@ def _call_json(datastore, system_prompt: str, user_prompt: str) -> dict:
             max_tokens=apply_local_token_multiplier(ASSIST_MAX_TOKENS, cfg),
             extra_body=_thinking_extra_body(cfg['model'], settings.thinking_budget),
             debug=settings.debug,
-        )) + (0, 0))[:4]
+        )
     except Exception as e:
+        record_outcome('setup', datastore, status='fail_open')
         from changedetectionio.blueprint.ui.diff import _clean_litellm_error
         logger.warning(f"AI assist call failed: {e}")
         raise AssistError(f'AI request failed: {_clean_litellm_error(e)}', http_status=502) from e
 
-    accumulate_global_tokens(datastore, tokens, input_tokens=input_tokens,
-                             output_tokens=output_tokens, model=cfg['model'])
+    record_usage('setup', datastore, None, completion_result, model=cfg['model'], cfg=cfg)
     try:
-        return parse_json_object(raw)
+        result = parse_json_object(completion_result.text)
+        result.update({
+            'status': 'incomplete' if completion_result.finish_reason == 'length' else 'ok',
+            'prompt_version': PROMPT_VERSION,
+        })
+        if completion_result.finish_reason == 'length':
+            record_outcome('setup', datastore, status='incomplete')
+        return result
     except ValueError:
-        logger.warning(f"AI assist: unusable reply {(raw or '')[:300]!r}")
+        record_outcome('setup', datastore, status='fail_open')
+        logger.warning(f"AI assist: unusable reply {(completion_result.text or '')[:300]!r}")
         raise AssistError('The AI reply could not be read. Try again, or try a different model.',
                           http_status=502) from None
 
@@ -246,12 +256,14 @@ def _validate_selectors(selectors, html, require_text=True) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def compile_line_rule(rule: str):
-    """A predicate with the processor's ignore_text semantics, or None if the rule is invalid.
+    """A bounded predicate with the processor's ignore_text semantics.
 
     /regex/flags is a regex search; anything else is a case-insensitive substring.
     """
     from changedetectionio.html_tools import (
         PERL_STYLE_REGEX,
+        BOUNDED_REGEX_TIMEOUT_SECONDS,
+        compile_bounded_regex,
         perl_style_slash_enclosed_regex_to_options,
     )
     rule = (rule or '').strip()
@@ -259,12 +271,22 @@ def compile_line_rule(rule: str):
         return None
     if re.search(PERL_STYLE_REGEX, rule, re.IGNORECASE):
         try:
-            rx = re.compile(perl_style_slash_enclosed_regex_to_options(rule))
-        except re.error:
+            rx, timeout = compile_bounded_regex(
+                perl_style_slash_enclosed_regex_to_options(rule),
+                timeout=BOUNDED_REGEX_TIMEOUT_SECONDS,
+            )
+            if rx.search('', timeout=timeout):
+                return None
+        except Exception:
             return None
-        if rx.search(''):  # matches everything
-            return None
-        return rx.search
+
+        def bounded_match(line):
+            try:
+                return rx.search(line, timeout=timeout)
+            except TimeoutError:
+                return None
+
+        return bounded_match
     needle = rule.lower()
     return lambda line: needle in line.lower()
 

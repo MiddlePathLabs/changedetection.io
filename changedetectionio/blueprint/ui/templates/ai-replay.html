@@ -1,0 +1,109 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="ai-review-page edit-form">
+  <div class="box-wrap inner">
+    <main>
+    <h1>{{ _('Intent replay') }} — {{ watch.label }}</h1>
+    <p>
+        {{ _('Select up to %(cap)s retained historical transitions to compare the saved intent with a proposed intent. Replay never saves the proposed intent, watch configuration, history, evidence, feedback, or live evaluation cache, and never sends notifications.', cap=replay_cap) }}
+    </p>
+    <p>
+        <a href="{{ url_for('ui.ui_diff.ai_review', uuid=uuid) }}">{{ _('Back to AI decision review') }}</a>
+    </p>
+
+    {% if error %}
+    <p class="inline-warning" role="alert">{{ error }}</p>
+    {% endif %}
+
+    <form method="get" action="{{ url_for('ui.ui_diff.ai_replay', uuid=uuid) }}" class="pure-form">
+        <fieldset>
+            <legend>{{ _('Historical transitions') }}</legend>
+            <p class="pure-form-message-inline">
+                {{ _('%(count)s snapshots are currently retained. The oldest snapshot cannot run by itself because no earlier retained version is available. Suppressed baselines remain selectable.', count=history_options|length) }}
+            </p>
+            {% for option in history_options|reverse %}
+            <label style="display:block; margin:0.35em 0;">
+                <input type="checkbox" name="version" value="{{ option.version }}" {% if option.selected %}checked{% endif %}>
+                {{ option.version }}
+                {% if option.suppressed %} — {{ _('AI suppressed baseline') }}{% endif %}
+                {% if not option.has_previous %} — {{ _('no earlier retained snapshot') }}{% endif %}
+            </label>
+            {% else %}
+            <p>{{ _('No retained snapshots are available for replay.') }}</p>
+            {% endfor %}
+        </fieldset>
+        <div class="pure-control-group">
+            <label for="replay-proposed-intent">{{ _('Proposed intent') }}</label>
+            <textarea id="replay-proposed-intent" name="proposed_intent" rows="3" maxlength="2000" required>{{ proposed_intent }}</textarea>
+        </div>
+        <button class="pure-button pure-button-primary" type="submit">{{ _('Estimate replay') }}</button>
+    </form>
+
+    {% if prepared and not error %}
+    <section aria-labelledby="replay-estimate-heading">
+        <h2 id="replay-estimate-heading">{{ _('Estimated replay cost') }}</h2>
+        <dl>
+            <dt>{{ _('Current intent') }}</dt><dd>{{ current_intent or _('Not configured') }}</dd>
+            <dt>{{ _('Proposed intent') }}</dt><dd>{{ prepared.proposed_intent }}</dd>
+            <dt>{{ _('Runnable transitions') }}</dt><dd>{{ prepared.transitions|length }}</dd>
+            <dt>{{ _('Dispatches before budget checks') }}</dt><dd>{{ estimate.calls }}</dd>
+            <dt>{{ _('Input / output / total token upper bound') }}</dt><dd>{{ '{:,}'.format(estimate.input_tokens) }} / {{ '{:,}'.format(estimate.output_tokens) }} / {{ '{:,}'.format(estimate.total_tokens) }}</dd>
+            <dt>{{ _('Estimated cost upper bound') }}</dt>
+            <dd>{% if estimate.unknown_cost %}{{ _('Unknown — the selected model has no bundled price or provider usage is not guaranteed.') }}{% else %}${{ '%.4f'|format(estimate.estimated_cost_usd) }}{% endif %}</dd>
+        </dl>
+        {% if prepared.unavailable %}
+        <p class="tip">{{ _('%(count)s selected transition(s) cannot run because retained history is incomplete:', count=prepared.unavailable|length) }}</p>
+        <ul>
+        {% for item in prepared.unavailable %}<li>{{ item.version }} — {{ item.reason }}</li>{% endfor %}
+        </ul>
+        {% endif %}
+        <p class="pure-form-message-inline">
+            {{ _('The estimate uses these exact selected transitions, the configured model and the evaluator output cap. Actual dispatch still checks the global soft budget before each call; exhausted calls are shown as budget-exceeded.') }}
+        </p>
+        {% if prepared.transitions %}
+        <form method="post" action="{{ url_for('ui.ui_diff.ai_replay', uuid=uuid) }}" class="pure-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            {% for version in prepared.selected %}<input type="hidden" name="version" value="{{ version }}">{% endfor %}
+            <input type="hidden" name="proposed_intent" value="{{ prepared.proposed_intent }}">
+            <button class="pure-button pure-button-primary" type="submit">{{ _('Run non-mutating replay') }}</button>
+        </form>
+        {% endif %}
+    </section>
+    {% endif %}
+
+    {% if results is not none %}
+    <section aria-labelledby="replay-results-heading">
+        <h2 id="replay-results-heading">{{ _('Current versus proposed results') }}</h2>
+        {% for item in results %}
+        <article class="ai-review-entry">
+            <h3>{{ item.transition.from_version }} → {{ item.transition.version }}</h3>
+            <div class="llm-replay-columns">
+                {% for label, result in [('Current', item.current), ('Proposed', item.proposed)] %}
+                <section aria-labelledby="replay-{{ loop.index }}-{{ item.transition.version }}">
+                    <h4 id="replay-{{ loop.index }}-{{ item.transition.version }}">{{ _(label) }}</h4>
+                    {% if result %}
+                    <dl>
+                        <dt>{{ _('Decision') }}</dt><dd>{{ _('Alert') if result.important else _('Suppress') }}</dd>
+                        <dt>{{ _('Status') }}</dt><dd>{{ result.status }}</dd>
+                        <dt>{{ _('Coverage') }}</dt><dd>{{ result.coverage }}</dd>
+                    </dl>
+                    <p><strong>{{ _('Explanation') }}</strong></p>
+                    <p>{{ result.explanation }}</p>
+                    <p><strong>{{ _('Evaluated diff') }}</strong></p>
+                    <pre class="monospace-preview">{{ result.evaluated_diff }}</pre>
+                    {% else %}
+                    <p class="tip">{{ _('No current decision was available for this intent.') }}</p>
+                    {% endif %}
+                </section>
+                {% endfor %}
+            </div>
+        </article>
+        {% else %}
+        <p>{{ _('No runnable transitions were selected.') }}</p>
+        {% endfor %}
+    </section>
+    {% endif %}
+    </main>
+  </div>
+</div>
+{% endblock %}

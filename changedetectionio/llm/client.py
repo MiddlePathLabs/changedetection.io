@@ -8,6 +8,7 @@ import copy
 import logging
 import os
 import time
+from dataclasses import dataclass
 
 from loguru import logger
 
@@ -51,6 +52,28 @@ _RETRY_BACKOFF_MAX = 30.0
 # (capped) instead of handing the caller an empty string.
 _EMPTY_LENGTH_RETRY_MULTIPLIER = 4
 _EMPTY_LENGTH_RETRY_MAX_TOKENS = 32_000
+
+
+@dataclass(frozen=True)
+class CompletionResult:
+    """The provider response and the usage facts the provider actually returned."""
+
+    text: str
+    finish_reason: str | None
+    total_tokens: int
+    input_tokens: int
+    output_tokens: int
+    usage_reported: bool
+
+    @property
+    def usage(self) -> dict:
+        """A serialisable usage view for callers that need one aggregate object."""
+        return {
+            'total_tokens': self.total_tokens,
+            'input_tokens': self.input_tokens,
+            'output_tokens': self.output_tokens,
+            'reported': self.usage_reported,
+        }
 
 
 def max_call_duration(timeout: int) -> int:
@@ -126,14 +149,15 @@ def completion(  # noqa: C901
     max_tokens: int = None,
     extra_body: dict = None,
     debug: bool = False,
-) -> tuple[str, int, int, int]:
+) -> CompletionResult:
     """
-    Call the LLM and return (response_text, total_tokens, input_tokens, output_tokens).
+    Call the LLM and return a :class:`CompletionResult`.
     Retries up to DEFAULT_RETRIES times (with backoff) on connection errors, rate limits
     and provider 5xx/overloaded errors. A timeout is NOT retried: a model too slow to answer
     within the deadline is just as slow the second time, and retrying multiplied the wait.
     An empty reply cut off by max_tokens (reasoning models) is retried once with more room.
-    Token counts are 0 if the provider doesn't return usage data.
+    Token counts are 0 if the provider doesn't return usage data; ``usage_reported``
+    distinguishes that case from a genuine zero-token response.
     Raises on network/auth errors — callers handle gracefully.
 
     timeout: seconds for the request. Local endpoints get a longer value than cloud —
@@ -179,6 +203,7 @@ def completion(  # noqa: C901
     _context_exc = getattr(litellm, 'ContextWindowExceededError', None)
     _expanded_for_empty = False
     _accum_total = _accum_in = _accum_out = 0
+    _usage_reported = False
 
     # Some models reject sampling params outright: Anthropic Claude Opus 4.7/4.8 and
     # Fable return HTTP 400 for 'temperature', and OpenAI reasoning models (o1/o3/gpt-5)
@@ -216,6 +241,7 @@ def completion(  # noqa: C901
                     )
 
             usage = getattr(response, 'usage', None)
+            _usage_reported = _usage_reported or usage is not None
             input_tokens = int(getattr(usage, 'prompt_tokens', 0) or 0) if usage else 0
             output_tokens = int(getattr(usage, 'completion_tokens', 0) or 0) if usage else 0
             total_tokens = (
@@ -264,7 +290,14 @@ def completion(  # noqa: C901
                 f"tokens={_accum_total} (in={_accum_in} out={_accum_out}) "
                 f"text_len={len(text)}"
             )
-            return text, _accum_total, _accum_in, _accum_out
+            return CompletionResult(
+                text=text,
+                finish_reason=finish,
+                total_tokens=_accum_total,
+                input_tokens=_accum_in,
+                output_tokens=_accum_out,
+                usage_reported=_usage_reported,
+            )
 
         except Exception as e:
             if _timeout_exc is not None and isinstance(e, _timeout_exc):

@@ -9,8 +9,6 @@ text. This module handles those cases gracefully.
 import json
 import re
 
-from changedetectionio.strtobool import strtobool
-
 # Reasoning models (DeepSeek-R1, Qwen reasoning, etc.) wrap their scratchpad in <think> tags.
 # Three shapes have to be handled, because the scratchpad routinely contains JSON of its own
 # ("initially I thought {"important": false}, but..."), so leaving any of it in place lets
@@ -20,19 +18,23 @@ _THINK_TAIL_RE = re.compile(r'^.*</think(?:ing)?>', re.DOTALL | re.IGNORECASE)
 _THINK_OPEN_RE = re.compile(r'<think(?:ing)?>', re.IGNORECASE)
 
 
-def _to_bool(value, default: bool = False) -> bool:
+def _to_bool(value) -> bool:
     """Safely coerce boolean values from LLM responses.
 
-    Handles native booleans, truthy/falsy integers (1/0), and string booleans
-    ("true", "false", "yes", "no", "1", "0") using strtobool.
-    Avoids Python's bool("false") -> True bug on stringified JSON booleans.
+    Only the forms in the evaluation contract are accepted. Invalid values raise
+    instead of becoming ``False``: a malformed answer must never suppress a change.
     """
-    if value is None:
-        return default
-    try:
-        return strtobool(value)
-    except (ValueError, AttributeError):
-        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == 'true':
+            return True
+        if normalized == 'false':
+            return False
+    raise ValueError('LLM boolean value must be true/false or 1/0')
 
 
 def _extract_json(raw: str) -> str:
@@ -97,7 +99,7 @@ def parse_eval_response(raw: str) -> dict:
     if 'important' not in data:
         raise ValueError('LLM evaluation response has no "important" key')
     return {
-        'important': _to_bool(data.get('important'), default=False),
+        'important': _to_bool(data.get('important')),
         'summary': str(data.get('summary', '')).strip(),
     }
 
@@ -111,7 +113,7 @@ def parse_preview_response(raw: str) -> dict:
     try:
         data = parse_json_object(raw)
         return {
-            'found': _to_bool(data.get('found'), default=False),
+            'found': _to_bool(data.get('found')),
             'answer': str(data.get('answer', '')).strip(),
         }
     except ValueError:

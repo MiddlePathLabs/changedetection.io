@@ -194,8 +194,17 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
             # endpoints (IANA-restricted api_base) get the relaxed 1800s local cap so
             # a cold-starting or slow-prefilling local model doesn't falsely fail the
             # test even though the same call would succeed in production (issue #4225).
-            from changedetectionio.llm.evaluator import apply_local_token_multiplier, get_llm_settings, resolve_llm_timeout
-            text, total_tokens, input_tokens, output_tokens = completion(
+            from changedetectionio.llm.evaluator import (
+                admit, apply_local_token_multiplier, get_llm_settings,
+                record_outcome, record_usage, resolve_llm_timeout,
+            )
+            if not admit('connection_test', None, datastore, cfg=llm_cfg):
+                return jsonify({
+                    'ok': False,
+                    'error': 'Monthly AI token budget reached. Resets next month.',
+                    'status': 'budget_exceeded',
+                }), 429
+            completion_result = completion(
                 model=model,
                 messages=[{'role': 'user', 'content':
                     'Respond with just the word: ready'}],
@@ -205,23 +214,36 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
                 max_tokens=apply_local_token_multiplier(200, llm_cfg),
                 debug=get_llm_settings(datastore).debug,
             )
-            reply = text.strip()
+            record_usage(
+                'connection_test', datastore, None, completion_result,
+                model=model, cfg=llm_cfg,
+            )
+            reply = completion_result.text.strip()
             if not reply:
+                record_outcome('connection_test', datastore, status='fail_open')
                 logger.warning(
                     f"LLM connection test: model={model!r} responded but returned empty content "
-                    f"tokens={total_tokens} (in={input_tokens} out={output_tokens}) — "
+                    f"tokens={completion_result.total_tokens} (in={completion_result.input_tokens} out={completion_result.output_tokens}) — "
                     f"check finish_reason in client debug log above"
                 )
                 return jsonify({'ok': False, 'error': 'Model responded but returned empty content — check server logs.'}), 400
 
             logger.success(
                 f"LLM connection test OK: model={model!r} "
-                f"tokens={total_tokens} (in={input_tokens} out={output_tokens}) "
+                f"tokens={completion_result.total_tokens} (in={completion_result.input_tokens} out={completion_result.output_tokens}) "
                 f"reply={reply!r}"
             )
-            return jsonify({'ok': True, 'text': reply, 'tokens': total_tokens})
+            return jsonify({
+                'ok': True, 'text': reply, 'tokens': completion_result.total_tokens,
+                'usage_reported': completion_result.usage_reported,
+                'status': 'ok',
+            })
 
         except Exception as e:
+            try:
+                record_outcome('connection_test', datastore, status='fail_open')
+            except Exception:
+                pass
             logger.error(f"LLM connection test FAILED: model={model!r} api_base={api_base!r} error={e}")
             logger.exception("LLM connection test full traceback:")
             return jsonify({'ok': False, 'error': str(e)}), 400
@@ -257,7 +279,8 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
         for watch in datastore.data['watching'].values():
             if not watch.data_dir:
                 continue
-            for f in glob.glob(os.path.join(watch.data_dir, 'change-summary-*.txt')):
+            for f in (glob.glob(os.path.join(watch.data_dir, 'change-summary-*.txt'))
+                      + glob.glob(os.path.join(watch.data_dir, 'change-summary-*.json'))):
                 try:
                     os.remove(f)
                     logger.info(f"LLM summary cache removed: {f}")

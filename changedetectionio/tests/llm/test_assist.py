@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from changedetectionio.llm import assist
+from changedetectionio.llm.client import CompletionResult
 
 PRODUCT_HTML = """
 <html><head><title>Widget 3000</title><script>var x = 1;</script><style>.a{}</style></head>
@@ -68,7 +69,10 @@ def _datastore(tags=None, llm=None):
 
 
 def _reply(obj):
-    return patch('changedetectionio.llm.client.completion', return_value=(json.dumps(obj), 100, 80, 20))
+    return patch(
+        'changedetectionio.llm.client.completion',
+        return_value=CompletionResult(json.dumps(obj), 'stop', 100, 80, 20, True),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +164,9 @@ class TestSuggestFilters:
 
     def test_unreadable_reply_is_a_502(self):
         watch = FakeWatch(snapshots={'100': 'x'}, html={'100': PRODUCT_HTML})
-        with patch('changedetectionio.llm.client.completion', return_value=('sorry, no', 10, 5, 5)):
+        with patch(
+                'changedetectionio.llm.client.completion',
+                return_value=CompletionResult('sorry, no', 'stop', 10, 5, 5, True)):
             with pytest.raises(assist.AssistError) as e:
                 assist.suggest_filters(watch, _datastore(), goal='price')
         assert e.value.http_status == 502

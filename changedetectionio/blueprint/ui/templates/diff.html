@@ -32,7 +32,7 @@
                 <select id="diff-from-version" name="from_version" class="needs-localtime">
                     {%- for version in versions|reverse -%}
                         <option value="{{ version }}" {% if version== from_version %} selected="" {% endif %}>
-                            {{ version }}{#{% if loop.index == 2 %} (Previous){% endif %}#}
+                            {{ version }}{% if watch_a.get_ai_history_markers().get(version, {}).get('suppressed_by_ai') %} — {{ _('AI suppressed') }}{% endif %}{#{% if loop.index == 2 %} (Previous){% endif %}#}
                         </option>
                     {%- endfor -%}
                 </select>
@@ -43,7 +43,7 @@
                 <select id="diff-to-version" name="to_version" class="needs-localtime">
                     {%- for version in versions|reverse -%}
                         <option value="{{ version }}" {% if version== to_version %} selected="" {% endif %}>
-                            {{ version }}{#{% if loop.first %} (Current){% endif %}#}
+                            {{ version }}{% if watch_a.get_ai_history_markers().get(version, {}).get('suppressed_by_ai') %} — {{ _('AI suppressed') }}{% endif %}{#{% if loop.first %} (Current){% endif %}#}
                         </option>
                     {%- endfor -%}
                 </select>
@@ -155,8 +155,11 @@
             </div>
         {%- endif -%}
         {%- if llm_configured -%}
-        <div id="llm-diff-summary-area"{% if not llm_diff_summary %} data-pending="1"{% endif %}>
+        <div id="llm-diff-summary-area" data-coverage="{{ llm_diff_summary_coverage or 'complete' }}"{% if not llm_diff_summary %} data-pending="1"{% endif %}>
             <span class="llm-diff-summary-label">&#x2728; {{ _('AI Change Summary') }}</span>
+            {% if llm_diff_summary and llm_diff_summary_coverage == 'partial' %}
+            <p class="llm-diff-summary-coverage">{{ _('Partial summary — covers only part of this change.') }}</p>
+            {% endif %}
             {%- if llm_diff_summary -%}
             <p class="llm-diff-summary-text">{{ llm_diff_summary }}</p>
             {%- else -%}
@@ -166,6 +169,9 @@
             {%- endif -%}
             {%- endif -%}
         </div>
+        <p class="llm-review-link">
+            <a href="{{ url_for('ui.ui_diff.ai_review', uuid=uuid) }}">{{ _('Review AI decisions and suppressed changes') }}</a>
+        </p>
         {%- endif -%}
         <div id="text-diff-heading-area"  style="user-select: none;">
             <div class="snapshot-age"><span>{{ from_version|format_timestamp_timeago }}</span>
@@ -236,10 +242,16 @@ $(function () {
             removed:           showRemoved,
             added:             showAdded,
         },
-        onDone: function (summary) {
+        onDone: function (summary, data) {
             $area.find('.llm-diff-summary-text')
                  .removeClass('llm-diff-summary-loading')
                  .text(summary);
+            if (data && data.coverage === 'partial') {
+                $area.find('.llm-diff-summary-coverage').remove();
+                $('<p class="llm-diff-summary-coverage"></p>')
+                    .text('{{ _('Partial summary — covers only part of this change.') }}')
+                    .insertBefore($area.find('.llm-diff-summary-text'));
+            }
             $area.find('.llm-diff-summary-prompt').remove();
             $area.removeAttr('data-pending');
         },

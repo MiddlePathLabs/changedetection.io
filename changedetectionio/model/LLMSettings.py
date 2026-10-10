@@ -8,7 +8,7 @@ the storage field names exactly — no aliases needed.
 """
 from typing import ClassVar, Tuple
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 LLM_DEFAULT_THINKING_BUDGET = 0
@@ -58,6 +58,9 @@ class LLMSettings(BaseModel):
     tokens_month_key: str = ''
     cost_usd_total_cumulative: float = 0.0
     cost_usd_this_month: float = 0.0
+    # Bounded counters keyed only by the known operation names. This is intentionally
+    # aggregate state, not an unbounded request/event ledger.
+    operation_metrics: dict = Field(default_factory=dict)
 
     # Provider-connection fields wiped on /llm/clear and when the model is emptied.
     CONNECTION_FIELDS: ClassVar[Tuple[str, ...]] = (
@@ -67,4 +70,5 @@ class LLMSettings(BaseModel):
     PROTECTED_FIELDS: ClassVar[Tuple[str, ...]] = (
         'tokens_total_cumulative', 'tokens_this_month', 'tokens_month_key',
         'cost_usd_total_cumulative', 'cost_usd_this_month',
+        'operation_metrics',
     )

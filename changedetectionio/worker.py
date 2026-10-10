@@ -44,6 +44,20 @@ def set_watch_minitext_status(watch, status):
     signal('watch_small_status_comment').send(watch_uuid=watch['uuid'], status=safe_status)
 
 
+def ai_suppresses_change(result):
+    """Return whether a complete, successful AI result may suppress an alert."""
+    return bool(
+        result
+        and result.get('status') in ('ok', 'cached')
+        and not result.get('important', True)
+    )
+
+
+def should_save_history_after_ai(changed_detected, ai_suppressed, history_n):
+    """Save first snapshots, ordinary changes, and valid AI-suppressed changes."""
+    return bool(changed_detected or ai_suppressed or not history_n)
+
+
 async def async_update_worker(worker_id, q, notification_q, app, datastore, executor=None):
     """
     Async worker function that processes watch check jobs from the queue.
@@ -442,6 +456,9 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         update_obj['_llm_result'] = None
                         update_obj['_llm_intent'] = ''
                         update_obj['_llm_change_summary'] = ''
+                        update_obj['_llm_summary_result'] = None
+                        ai_suppressed = False
+                        _llm_from_version = None
                         # skip_check: when budget exceeded, don't run LLM or the check.
                         # Also gated on llm_enabled — a disabled LLM can't be spending tokens,
                         # so the budget enforcement shouldn't suppress changes when the user
@@ -509,12 +526,13 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                         update_obj['_llm_result'] = _llm_result
                                         update_obj['_llm_intent'] = _llm_intent
 
-                                        if _llm_result and not _llm_result.get('important', True):
+                                        if ai_suppresses_change(_llm_result):
                                             changed_detected = False
+                                            ai_suppressed = True
                                             logger.info(
                                                 f"LLM filtered out change for {uuid} "
                                                 f"(intent from {_llm_intent_source}): "
-                                                f"{_llm_result.get('summary', '')[:80]}"
+                                                f"{_llm_result.get('explanation', _llm_result.get('summary', ''))[:80]}"
                                             )
 
                                     # Step 2: AI Change Summary — only compute it when a notification
@@ -529,20 +547,26 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                     if (changed_detected and _diff_text.strip()
                                             and watch_will_send_content_changed_notification(datastore, watch)):
                                         set_watch_minitext_status(watch, "AI/LLM (summary)..")
-                                        _change_summary = await loop.run_in_executor(
+                                        _change_summary_result = await loop.run_in_executor(
                                             executor,
                                             lambda diff=_diff_text, snap=contents: summarise_change(
                                                 watch, datastore, diff=diff, current_snapshot=snap
                                             )
                                         )
-                                        if _change_summary:
-                                            update_obj['_llm_change_summary'] = _change_summary
+                                        update_obj['_llm_summary_result'] = _change_summary_result
+                                        if (_change_summary_result
+                                                and _change_summary_result.get('text')):
+                                            update_obj['_llm_change_summary'] = _change_summary_result['text']
                             except Exception as e:
                                 logger.warning(f"LLM evaluation error for {uuid}: {e}")
 
                         datastore.update_watch(uuid=uuid, update_obj=update_obj)
 
-                        if changed_detected or not watch.history_n:
+                        # A valid negative AI decision suppresses the alert but still commits the
+                        # fetched snapshot, so the next diff starts from this exact baseline. A
+                        # budget skip or provider failure does not count as suppression and keeps
+                        # the existing check/notification behavior.
+                        if should_save_history_after_ai(changed_detected, ai_suppressed, watch.history_n):
                             if update_handler.screenshot:
                                 watch.save_screenshot(screenshot=update_handler.screenshot)
                                 # Free screenshot memory immediately after saving
@@ -567,6 +591,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                                     timestamp=int(fetch_start_time),
                                                     snapshot_id=update_obj.get('previous_md5', 'none'))
 
+                            if update_obj.get('_llm_result') and _llm_from_version:
+                                watch.save_ai_decision(
+                                    version=list(watch.history.keys())[-1],
+                                    decision=update_obj['_llm_result'],
+                                    intent=update_obj.get('_llm_intent', ''),
+                                    from_version=_llm_from_version,
+                                    suppressed_by_ai=ai_suppressed,
+                                )
+
                             # Save AI summary file now that the new snapshot is committed —
                             # watch.history.keys()[-1] now reflects the just-saved version,
                             # so the cache filename matches what the UI will later look up.
@@ -590,7 +623,10 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                         model=_llm_model,
                                     )
                                     watch.save_llm_diff_summary(
-                                        update_obj['_llm_change_summary'],
+                                        update_obj['_llm_summary_result'] or {
+                                            'text': update_obj['_llm_change_summary'],
+                                            'status': 'ok', 'coverage': 'complete',
+                                        },
                                         _llm_from_version,
                                         _llm_to_version,
                                         prompt=_llm_cache_prompt,
@@ -607,7 +643,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                             del contents
 
                             # Send notifications on second+ check
-                            if watch.history_n >= 2:
+                            if not ai_suppressed and watch.history_n >= 2:
                                 logger.info(f"Change detected in UUID {uuid} - {watch['url']}")
                                 if not watch.get('notification_muted'):
                                     await send_content_changed_notification(uuid, notification_q, datastore)

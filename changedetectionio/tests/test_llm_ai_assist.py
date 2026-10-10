@@ -13,6 +13,7 @@ from unittest.mock import patch
 from flask import url_for
 
 from changedetectionio.tests.util import delete_all_watches
+from changedetectionio.llm.client import CompletionResult
 
 PAGE = """<html><body>
 <main id="product"><h1 itemprop="name">Widget</h1>
@@ -44,13 +45,13 @@ def test_ai_assist_filters_and_noise(client, live_server, measure_memory_usage, 
     before = dict(watch)
 
     reply = json.dumps({'include_filters': ['[itemprop=price]', '#missing'], 'reason': 'itemprop'})
-    with patch('changedetectionio.llm.client.completion', return_value=(reply, 10, 8, 2)):
+    with patch('changedetectionio.llm.client.completion', return_value=CompletionResult(reply, 'stop', 10, 8, 2, True)):
         code, data = _post(client, uuid, 'filters', {'goal': 'the price'})
     assert code == 200, data
     assert [s['value'] for s in data['include_filters']] == ['[itemprop=price]']
 
     reply = json.dumps({'ignore_text': [{'pattern': 'people are viewing', 'why': 'counter'}]})
-    with patch('changedetectionio.llm.client.completion', return_value=(reply, 10, 8, 2)):
+    with patch('changedetectionio.llm.client.completion', return_value=CompletionResult(reply, 'stop', 10, 8, 2, True)):
         code, data = _post(client, uuid, 'noise')
     assert code == 200, data
     assert [a['value'] for a in data['ignore_text']] == ['people are viewing']
@@ -71,7 +72,7 @@ def test_ai_assist_diagnose_uses_saved_error_html(client, live_server, measure_m
 
     reply = json.dumps({'cause': 'layout_changed', 'diagnosis': 'Renamed.', 'fixes': ['x'],
                         'include_filters': ['[itemprop=price]']})
-    with patch('changedetectionio.llm.client.completion', return_value=(reply, 10, 8, 2)):
+    with patch('changedetectionio.llm.client.completion', return_value=CompletionResult(reply, 'stop', 10, 8, 2, True)):
         code, data = _post(client, uuid, 'diagnose')
     assert code == 200, data
     assert data['html_note'] == 'HTML of the failing fetch'

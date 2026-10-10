@@ -4,6 +4,8 @@ Unit tests for changedetectionio/llm/response_parser.py
 All functions are pure — no external dependencies needed.
 """
 
+import json
+
 import pytest
 
 from changedetectionio.llm.response_parser import (
@@ -216,6 +218,11 @@ class TestParseEvalResponse:
         result = parse_eval_response(raw)
         assert result['important'] is False
         assert result['summary'] == 'skip'
+
+    @pytest.mark.parametrize('value', ['maybe', None, [], {}, 2, -1])
+    def test_invalid_important_values_raise(self, value):
+        with pytest.raises(ValueError):
+            parse_eval_response(json.dumps({'important': value, 'summary': 'bad'}))
 
 
 class TestParsePreviewResponse:

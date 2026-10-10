@@ -6,7 +6,8 @@ Two public entry points:
 
 Intent resolution: watch.llm_intent → first tag with llm_intent whose AI switch is "on"
                    (see tag_llm_applies_to_watches) → None (no evaluation)
-Cache: each (intent, diff) pair is evaluated exactly once, result stored in watch.
+Cache: each complete effective evaluation request is evaluated once for live watches;
+non-persisting replay requests bypass live cache and watch state.
 
 Environment variable overrides (take priority over datastore settings):
   LLM_MODEL    — model string (e.g. "gpt-4o-mini", "ollama/llama3.2")
@@ -20,6 +21,7 @@ Environment variable overrides (take priority over datastore settings):
 """
 
 import hashlib
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,10 +30,12 @@ from loguru import logger
 from changedetectionio.strtobool import strtobool
 
 from . import client as llm_client
+from .bm25_trim import trim_to_relevant
 from .prompt_builder import (
     build_change_summary_prompt, build_change_summary_system_prompt,
     build_eval_prompt, build_eval_system_prompt,
     build_preview_prompt, build_preview_system_prompt,
+    PROMPT_VERSION,
 )
 from .response_parser import parse_eval_response, parse_preview_response
 
@@ -41,6 +45,110 @@ from changedetectionio.model.LLMSettings import (
     LLM_DEFAULT_MAX_SUMMARY_TOKENS,
     LLM_DEFAULT_THINKING_BUDGET,
 )
+
+
+LLM_OPERATIONS = ('evaluation', 'summary', 'preview', 'restock', 'setup', 'connection_test', 'replay')
+WATCH_BUDGET_OPERATIONS = frozenset(('evaluation', 'summary'))
+_METRIC_FIELDS = (
+    'dispatched_calls', 'input_tokens', 'output_tokens', 'tokens',
+    'estimated_cost_usd', 'unknown_usage', 'unknown_cost',
+    'cache_lookups', 'cache_hits', 'fail_open', 'budget_skips', 'incomplete',
+)
+
+
+def _empty_metric_bucket() -> dict:
+    return {field: 0.0 if field == 'estimated_cost_usd' else 0 for field in _METRIC_FIELDS}
+
+
+def _normalise_metrics(raw) -> dict:
+    metrics = {}
+    raw = raw if isinstance(raw, dict) else {}
+    for operation in LLM_OPERATIONS:
+        bucket = raw.get(operation) if isinstance(raw.get(operation), dict) else {}
+        clean = _empty_metric_bucket()
+        for field in _METRIC_FIELDS:
+            value = bucket.get(field, 0)
+            try:
+                clean[field] = float(value) if field == 'estimated_cost_usd' else int(value)
+            except (TypeError, ValueError):
+                clean[field] = 0.0 if field == 'estimated_cost_usd' else 0
+        metrics[operation] = clean
+    return metrics
+
+
+def normalise_llm_metrics(raw) -> dict:
+    """Return the bounded, known-operation metric shape for UI consumers."""
+    return _normalise_metrics(raw)
+
+
+def _record_metric(datastore, operation: str, field: str, amount=1, watch=None) -> None:
+    if operation not in LLM_OPERATIONS or field not in _METRIC_FIELDS:
+        raise ValueError(f'Unknown LLM metric: {operation}.{field}')
+    with datastore.lock:
+        settings = get_llm_settings(datastore)
+        metrics = _normalise_metrics(settings.operation_metrics)
+        metrics[operation][field] += amount
+        settings.operation_metrics = metrics
+        datastore.data['settings']['application']['llm'] = settings.model_dump()
+        if watch is not None:
+            watch_metrics = _normalise_metrics(watch.get('llm_metrics'))
+            watch_metrics[operation][field] += amount
+            watch['llm_metrics'] = watch_metrics
+        datastore.commit()
+
+
+def record_outcome(operation: str, datastore, watch=None, status: str = '') -> None:
+    """Record bounded outcome counters without creating an event ledger."""
+    field = {
+        'cached': 'cache_hits',
+        'fail_open': 'fail_open',
+        'budget_exceeded': 'budget_skips',
+        'incomplete': 'incomplete',
+    }.get(status)
+    if field:
+        _record_metric(datastore, operation, field, watch=watch)
+
+
+def record_usage(operation: str, datastore, watch, completion_result, model: str = '', cfg: dict = None) -> None:
+    """Record one admitted provider call, including providers that omit usage."""
+    total = int(getattr(completion_result, 'total_tokens', 0) or 0)
+    input_tokens = int(getattr(completion_result, 'input_tokens', 0) or 0)
+    output_tokens = int(getattr(completion_result, 'output_tokens', 0) or 0)
+    usage_reported = bool(getattr(completion_result, 'usage_reported', False))
+    if watch is not None and operation in WATCH_BUDGET_OPERATIONS:
+        _check_token_budget(watch, cfg or {}, total)
+    if watch is not None:
+        watch['llm_last_tokens_used'] = total
+    if total > 0:
+        accumulate_global_tokens(
+            datastore, total, input_tokens=input_tokens,
+            output_tokens=output_tokens, model=model,
+        )
+    _record_metric(datastore, operation, 'input_tokens', input_tokens, watch=watch)
+    _record_metric(datastore, operation, 'output_tokens', output_tokens, watch=watch)
+    _record_metric(datastore, operation, 'tokens', total, watch=watch)
+    if not usage_reported:
+        _record_metric(datastore, operation, 'unknown_usage', watch=watch)
+    estimated_cost = estimate_cost_usd(model, input_tokens, output_tokens)
+    if not usage_reported or estimated_cost is None:
+        _record_metric(datastore, operation, 'unknown_cost', watch=watch)
+    elif estimated_cost:
+        _record_metric(datastore, operation, 'estimated_cost_usd', estimated_cost, watch=watch)
+
+
+def admit(operation: str, watch, datastore, cfg: dict = None) -> bool:
+    """Atomically apply the shared soft-budget policy before a paid dispatch."""
+    if operation not in LLM_OPERATIONS:
+        raise ValueError(f'Unknown LLM operation: {operation}')
+    cfg = cfg or get_llm_config(datastore) or {}
+    if is_global_token_budget_exceeded(datastore):
+        _record_metric(datastore, operation, 'budget_skips', watch=watch)
+        return False
+    if operation in WATCH_BUDGET_OPERATIONS and watch is not None and not _check_token_budget(watch, cfg):
+        _record_metric(datastore, operation, 'budget_skips', watch=watch)
+        return False
+    _record_metric(datastore, operation, 'dispatched_calls', watch=watch)
+    return True
 
 
 def is_llm_features_disabled() -> bool:
@@ -108,6 +216,12 @@ def fit_diff_to_budget(diff: str, max_chars: int) -> str:
     keep = max(0, max_chars - len(_DIFF_TRIM_MARKER))
     cut = trimmed.rfind('\n', 0, keep)
     return trimmed[:cut if cut > 0 else keep] + _DIFF_TRIM_MARKER
+
+
+def fit_diff_to_budget_with_coverage(diff: str, max_chars: int) -> tuple[str, bool]:
+    """Return the fitted diff plus whether any source content was omitted."""
+    fitted = fit_diff_to_budget(diff, max_chars)
+    return fitted, fitted != diff
 
 
 def _thinking_extra_body(model: str, budget: int) -> dict | None:
@@ -537,24 +651,37 @@ def get_global_token_budget_month(datastore=None) -> int:
     return 0
 
 
+def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    """Return a priced estimate, or ``None`` when the model/usage is unknown."""
+    if not model:
+        return None
+    if not input_tokens and not output_tokens:
+        return 0.0
+    try:
+        import litellm
+
+        model_name = str(model)
+        candidates = {model_name, model_name.split('/', 1)[-1]}
+        if not any(candidate in litellm.model_cost for candidate in candidates):
+            return None
+        from litellm.cost_calculator import cost_per_token
+        prompt_cost, completion_cost = cost_per_token(
+            model=model_name,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+        )
+        return float(prompt_cost + completion_cost)
+    except Exception:
+        return None
+
+
 def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
     """
     Return estimated cost in USD using litellm's pricing database.
     Returns 0.0 for unknown models (local/Ollama/custom endpoints).
     Never raises — cost estimation is best-effort.
     """
-    if not model or (not input_tokens and not output_tokens):
-        return 0.0
-    try:
-        from litellm.cost_calculator import cost_per_token
-        prompt_cost, completion_cost = cost_per_token(
-            model=model,
-            prompt_tokens=input_tokens,
-            completion_tokens=output_tokens,
-        )
-        return float(prompt_cost + completion_cost)
-    except Exception:
-        return 0.0
+    return estimate_cost_usd(model, input_tokens, output_tokens) or 0.0
 
 
 def accumulate_global_tokens(datastore, tokens: int,
@@ -630,11 +757,11 @@ def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
       - rolls over watch['llm_tokens_this_period'] if a new period started
       - increments the per-period counter
       - also increments the existing lifetime counter (UI stat, unchanged)
-    Returns False once the per-period counter exceeds max_tokens_per_count_period
+    Returns False once the per-period counter reaches max_tokens_per_count_period
     so subsequent evaluate_change calls bail out for this watch until rollover.
 
-    Note: only evaluate_change actually gates on the return value (the other
-    callers invoke this for the side-effect of accumulating tokens).
+    Evaluation and summary calls gate on this value; global-only operations,
+    including replay, never consume the per-watch period counter.
     """
     if tokens_this_call > 0:
         current_period = _get_month_key()
@@ -652,10 +779,10 @@ def _check_token_budget(watch, cfg, tokens_this_call: int = 0) -> bool:
         # same counter — but a stale period key means "no usage yet this period".
         if watch.get('llm_tokens_period_key') == _get_month_key():
             total = watch.get('llm_tokens_this_period') or 0
-            if total > max_per_period:
+            if total >= max_per_period:
                 logger.warning(
                     f"LLM per-period token budget exceeded for {watch.get('uuid')}: "
-                    f"{total} tokens > limit {max_per_period}"
+                    f"{total} tokens >= limit {max_per_period}"
                 )
                 return False
 
@@ -773,7 +900,8 @@ def build_summary_cache_prompt(effective_prompt: str, max_summary_tokens: int,
     if prefs is None:
         prefs = DiffPrefs()
     return (
-        effective_prompt
+        f'prompt_version:{PROMPT_VERSION}\x00'
+        + effective_prompt
         + prefs.cache_key_suffix()
         + f'\x00sys:{build_change_summary_system_prompt()}'
         + f'\x00max_tokens:{max_summary_tokens}'
@@ -781,34 +909,40 @@ def build_summary_cache_prompt(effective_prompt: str, max_summary_tokens: int,
     )
 
 
-def summarise_change(watch, datastore, diff: str, current_snapshot: str = '') -> str:
+def _summary_result(text: str = '', status: str = 'ok', coverage: str = 'complete',
+                    model: str = '', finish_reason: str = None, usage_reported: bool = False,
+                    error: str = '') -> dict:
+    return {
+        'text': text,
+        'status': status,
+        'coverage': coverage,
+        'model': model,
+        'prompt_version': PROMPT_VERSION,
+        'finish_reason': finish_reason,
+        'usage_reported': usage_reported,
+        **({'error': error} if error else {}),
+    }
+
+
+def summarise_change(watch, datastore, diff: str, current_snapshot: str = '') -> dict | None:
     """
     Generate a plain-language summary of the change using the watch's
     llm_change_summary prompt (cascades from tag if not set on watch).
 
-    Returns the summary string, or '' on failure.
+    Returns a result object with ``text``, ``status`` and ``coverage``. ``None`` means
+    that no configured provider/summary input was available.
     The result replaces {{ diff }} in notifications so the user gets a
     readable description instead of raw +/- diff lines.
     """
     cfg = _runtime_llm_config(datastore)
     if not cfg:
-        return ''
-
-    if is_global_token_budget_exceeded(datastore):
-        budget = get_global_token_budget_month(datastore)
-        llm_cfg = datastore.data['settings']['application'].get('llm') or {}
-        used = llm_cfg.get('tokens_this_month', 0)
-        logger.warning(
-            f"LLM summarise_change skipped: monthly budget {budget:,} reached "
-            f"({used:,} used this month)"
-        )
-        return ''
+        return None
 
     custom_prompt = get_effective_summary_prompt(watch, datastore)
     if not diff.strip():
-        return ''
+        return _summary_result(model=cfg.get('model', ''))
 
-    diff = fit_diff_to_budget(diff, _get_max_input_chars(datastore))
+    diff, diff_truncated = fit_diff_to_budget_with_coverage(diff, _get_max_input_chars(datastore))
     url = watch.get('url', '')
     title = watch.get('page_title') or watch.get('title') or ''
 
@@ -822,6 +956,11 @@ def summarise_change(watch, datastore, diff: str, current_snapshot: str = '') ->
     )
 
     settings = get_llm_settings(datastore)
+    if not admit('summary', watch, datastore, cfg=cfg):
+        return _summary_result(
+            status='budget_exceeded', coverage='partial' if diff_truncated else 'complete',
+            model=cfg.get('model', ''), error='Monthly or per-watch AI token budget reached.',
+        )
     _extra_body = _thinking_extra_body(cfg['model'], settings.thinking_budget)
 
     try:
@@ -841,24 +980,28 @@ def summarise_change(watch, datastore, diff: str, current_snapshot: str = '') ->
             extra_body=_extra_body,
             debug=settings.debug,
         )
-        raw, tokens = _resp[0], _resp[1]
-        input_tokens  = _resp[2] if len(_resp) > 2 else 0
-        output_tokens = _resp[3] if len(_resp) > 3 else 0
-        summary = raw.strip()
-        # _check_token_budget also bumps llm_tokens_used_cumulative - don't add it twice.
-        _check_token_budget(watch, cfg, tokens)
-        watch['llm_last_tokens_used'] = tokens
-        accumulate_global_tokens(datastore, tokens,
-                                 input_tokens=input_tokens,
-                                 output_tokens=output_tokens,
-                                 model=cfg['model'])
+        summary = _resp.text.strip()
+        record_usage('summary', datastore, watch, _resp, model=cfg['model'], cfg=cfg)
+        coverage = 'partial' if diff_truncated or _resp.finish_reason == 'length' else 'complete'
+        status = 'incomplete' if diff_truncated or _resp.finish_reason == 'length' else 'ok'
+        if status == 'incomplete':
+            record_outcome('summary', datastore, watch, status='incomplete')
         logger.debug(
-            f"LLM change summary {watch.get('uuid')}: tokens={tokens} "
+            f"LLM change summary {watch.get('uuid')}: tokens={_resp.total_tokens} "
             f"summary={summary[:80]}"
         )
-        return summary
-    except Exception:
-        raise
+        return _summary_result(
+            text=summary, status=status, coverage=coverage, model=cfg.get('model', ''),
+            finish_reason=_resp.finish_reason, usage_reported=_resp.usage_reported,
+            error='The AI summary was cut short.' if not summary and status == 'incomplete' else '',
+        )
+    except Exception as e:
+        record_outcome('summary', datastore, watch, status='fail_open')
+        logger.warning(f"LLM change summary failed for {watch.get('uuid')}: {e}")
+        return _summary_result(
+            status='fail_open', coverage='partial' if diff_truncated else 'complete',
+            model=cfg.get('model', ''), error=str(e),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -874,7 +1017,8 @@ def preview_extract(watch, datastore, content: str) -> dict | None:
     directly answer the intent against the current snapshot — giving the user
     immediate feedback like "30 articles listed" or "Price: $149, 25% off".
 
-    Returns {'found': bool, 'answer': str} or None if LLM not configured / no intent.
+    Returns {'found': bool, 'answer': str, 'status': str} or None if LLM not
+    configured / no intent.
     """
     cfg = _runtime_llm_config(datastore)
     if not cfg:
@@ -892,9 +1036,15 @@ def preview_extract(watch, datastore, content: str) -> dict | None:
     system_prompt = build_preview_system_prompt()
     user_prompt = build_preview_prompt(intent, content, url=url, title=title)
     settings = get_llm_settings(datastore)
+    if not admit('preview', watch, datastore, cfg=cfg):
+        return {
+            'found': False, 'answer': '', 'status': 'budget_exceeded',
+            'coverage': 'complete', 'model': cfg.get('model', ''),
+            'prompt_version': PROMPT_VERSION,
+        }
 
     try:
-        _resp = tuple(llm_client.completion(
+        _resp = llm_client.completion(
             model=cfg['model'],
             messages=[
                 _cached_system(system_prompt, model=cfg['model']),
@@ -906,17 +1056,25 @@ def preview_extract(watch, datastore, content: str) -> dict | None:
             max_tokens=apply_local_token_multiplier(JSON_RESPONSE_MAX_TOKENS, cfg),
             extra_body=_thinking_extra_body(cfg['model'], settings.thinking_budget),
             debug=settings.debug,
-        ))
-        raw, tokens, input_tokens, output_tokens = (_resp + (0, 0))[:4]
-        accumulate_global_tokens(datastore, tokens, input_tokens=input_tokens,
-                                 output_tokens=output_tokens, model=cfg['model'])
-        result = parse_preview_response(raw)
+        )
+        record_usage('preview', datastore, watch, _resp, model=cfg['model'], cfg=cfg)
+        result = parse_preview_response(_resp.text)
+        result.update({
+            'status': 'incomplete' if _resp.finish_reason == 'length' else 'ok',
+            'coverage': 'complete', 'model': cfg.get('model', ''),
+            'prompt_version': PROMPT_VERSION,
+            'finish_reason': _resp.finish_reason,
+            'usage_reported': _resp.usage_reported,
+        })
+        if result['status'] == 'incomplete':
+            record_outcome('preview', datastore, watch, status='incomplete')
         logger.debug(
             f"LLM preview {watch.get('uuid')}: found={result['found']} "
-            f"tokens={tokens} answer={result['answer'][:80]}"
+            f"tokens={_resp.total_tokens} answer={result['answer'][:80]}"
         )
         return result
     except Exception as e:
+        record_outcome('preview', datastore, watch, status='fail_open')
         logger.warning(f"LLM preview extraction failed for {watch.get('uuid')}: {e}")
         return None
 
@@ -928,62 +1086,143 @@ def preview_extract(watch, datastore, content: str) -> dict | None:
 EVAL_CACHE_MAX_ENTRIES = 50
 
 
-def compute_eval_cache_key(intent: str, diff: str, model: str = '') -> str:
-    return hashlib.sha256(f"{model}||{intent}||{diff}".encode()).hexdigest()
+def compute_eval_cache_key(intent: str, diff: str, model: str = '', current_snapshot: str = '',
+                           system_prompt: str = '') -> str:
+    """Identify the complete effective evaluation request, including untrimmed input."""
+    if not system_prompt:
+        system_prompt = build_eval_system_prompt()
+    snapshot_excerpt = trim_to_relevant(
+        current_snapshot, intent, max_chars=30_000,
+    ) if current_snapshot else ''
+    material = '\x00'.join((
+        PROMPT_VERSION, model or '', intent or '', diff or '', system_prompt,
+        snapshot_excerpt,
+    ))
+    return hashlib.sha256(material.encode('utf-8', errors='replace')).hexdigest()
 
 
-def evaluate_change(watch, datastore, diff: str, current_snapshot: str = '') -> dict | None:
+def estimate_evaluation_request(watch, datastore, diff: str, current_snapshot: str = '',
+                                intent: str = '') -> dict:
+    """Estimate one bounded evaluation request without dispatching or mutating state."""
+    cfg = _runtime_llm_config(datastore) or {}
+    effective_intent = (intent or '').strip()
+    if not effective_intent:
+        effective_intent = resolve_intent(watch, datastore)[0]
+    fitted_diff, _ = fit_diff_to_budget_with_coverage(
+        diff or '', _get_max_input_chars(datastore),
+    )
+    system_prompt = build_eval_system_prompt()
+    user_prompt = build_eval_prompt(
+        intent=effective_intent,
+        diff=fitted_diff,
+        current_snapshot=current_snapshot or '',
+        url=watch.get('url', ''),
+        title=watch.get('page_title') or watch.get('title') or '',
+    )
+    input_tokens = math.ceil((len(system_prompt) + len(user_prompt)) / 3)
+    output_tokens = apply_local_token_multiplier(JSON_RESPONSE_MAX_TOKENS, cfg)
+    model = cfg.get('model', '')
+    return {
+        'model': model,
+        'input_tokens': input_tokens,
+        'output_tokens': output_tokens,
+        'total_tokens': input_tokens + output_tokens,
+        'estimated_cost_usd': estimate_cost_usd(model, input_tokens, output_tokens),
+    }
+
+
+def _evaluation_result(important: bool, summary: str, status: str, coverage: str,
+                      evaluated_diff: str, model: str, finish_reason=None,
+                      usage_reported: bool = False, input_tokens: int = 0,
+                      output_tokens: int = 0, total_tokens: int = 0) -> dict:
+    return {
+        'important': important,
+        'summary': summary,
+        'explanation': summary,
+        'status': status,
+        'coverage': coverage,
+        'evaluated_diff': evaluated_diff,
+        'model': model,
+        'prompt_version': PROMPT_VERSION,
+        'finish_reason': finish_reason,
+        'usage_reported': usage_reported,
+        'input_tokens': input_tokens,
+        'output_tokens': output_tokens,
+        'total_tokens': total_tokens,
+    }
+
+
+def evaluate_change(watch, datastore, diff: str, current_snapshot: str = '', *,
+                    intent_override: str | None = None, persist: bool = True,
+                    operation: str = 'evaluation') -> dict | None:
     """
     Evaluate whether `diff` matches the watch's intent.
-    Returns {'important': bool, 'summary': str} or None if LLM not configured / no intent.
+    Returns a structured evaluation result or None if LLM not configured / no intent.
 
-    Results are cached by (intent, diff) hash — each unique diff is evaluated exactly once.
+    Normal evaluations are cached by the complete request identity. A replay passes
+    ``persist=False`` and ``operation='replay'`` so it uses the same request/parser
+    path while only recording global usage and never touching live watch state.
     """
     cfg = _runtime_llm_config(datastore)
     if not cfg:
         return None
 
-    intent, source = resolve_intent(watch, datastore)
+    if intent_override is None:
+        intent, source = resolve_intent(watch, datastore)
+    else:
+        intent, source = (intent_override or '').strip(), 'replay'
     if not intent:
         return None
 
     if not diff or not diff.strip():
-        return {'important': False, 'summary': ''}
+        return _evaluation_result(
+            False, '', 'ok', 'complete', '', cfg.get('model', ''),
+        )
 
-    diff = fit_diff_to_budget(diff, _get_max_input_chars(datastore))
+    original_diff = diff
+    fitted_diff, diff_truncated = fit_diff_to_budget_with_coverage(
+        diff, _get_max_input_chars(datastore),
+    )
+    system_prompt = build_eval_system_prompt()
 
     # Cache lookup — evaluations are deterministic once cached. The model is part of the key
     # so switching models re-evaluates instead of replaying the old model's verdicts.
-    cache_key = compute_eval_cache_key(intent, diff, cfg.get('model', ''))
-    cache = watch.get('llm_evaluation_cache') or {}
-    if cache_key in cache:
+    cache_key = compute_eval_cache_key(
+        intent, original_diff, cfg.get('model', ''), current_snapshot=current_snapshot,
+        system_prompt=system_prompt,
+    )
+    if persist:
+        # Count the denominator at the real live-cache lookup. Provider dispatches are not
+        # cache lookups, so they cannot be used to derive a hit rate without fabricating one.
+        _record_metric(datastore, operation, 'cache_lookups', watch=watch)
+    cache = watch.get('llm_evaluation_cache') or {} if persist else {}
+    if persist and cache_key in cache:
         logger.debug(f"LLM cache hit for {watch.get('uuid')} key={cache_key[:8]}")
-        return cache[cache_key]
+        result = dict(cache[cache_key])
+        result.update({
+            'status': 'cached',
+            'coverage': result.get('coverage', 'complete'),
+            'evaluated_diff': result.get('evaluated_diff', fitted_diff),
+            'model': result.get('model', cfg.get('model', '')),
+            'prompt_version': result.get('prompt_version', PROMPT_VERSION),
+            'explanation': result.get('explanation', result.get('summary', '')),
+        })
+        record_outcome(operation, datastore, watch, status='cached')
+        return result
 
-    # Check global monthly budget before making the call
-    if is_global_token_budget_exceeded(datastore):
-        budget = get_global_token_budget_month(datastore)
-        llm_cfg = datastore.data['settings']['application'].get('llm') or {}
-        used = llm_cfg.get('tokens_this_month', 0)
-        logger.warning(
-            f"LLM evaluate_change skipped for {watch.get('uuid')}: monthly budget {budget:,} reached "
-            f"({used:,} used this month) — passing change through as important"
+    coverage = 'partial' if diff_truncated else 'complete'
+    metrics_watch = watch if persist else None
+    if not admit(operation, metrics_watch, datastore, cfg=cfg):
+        return _evaluation_result(
+            True, '', 'budget_exceeded', coverage, fitted_diff, cfg.get('model', ''),
         )
-        # Fail open: don't suppress notifications when budget is exhausted
-        return {'important': True, 'summary': ''}
-
-    # Check per-watch cumulative budget before making the call
-    if not _check_token_budget(watch, cfg):
-        # Already over budget — fail open (don't suppress notification)
-        return {'important': True, 'summary': ''}
 
     url = watch.get('url', '')
     title = watch.get('page_title') or watch.get('title') or ''
 
-    system_prompt = build_eval_system_prompt()
     user_prompt = build_eval_prompt(
         intent=intent,
-        diff=diff,
+        diff=fitted_diff,
         current_snapshot=current_snapshot,
         url=url,
         title=title,
@@ -1004,45 +1243,62 @@ def evaluate_change(watch, datastore, diff: str, current_snapshot: str = '') -> 
             extra_body=_thinking_extra_body(cfg['model'], settings.thinking_budget),
             debug=settings.debug,
         )
-        raw, tokens = _resp[0], _resp[1]
-        input_tokens  = _resp[2] if len(_resp) > 2 else 0
-        output_tokens = _resp[3] if len(_resp) > 3 else 0
+        record_usage(operation, datastore, metrics_watch, _resp, model=cfg['model'], cfg=cfg)
     except Exception as e:
+        record_outcome(operation, datastore, metrics_watch, status='fail_open')
         logger.warning(f"LLM evaluation failed for {watch.get('uuid')}: {e}")
         # On failure: don't suppress the notification — pass through as important
-        watch['llm_last_tokens_used'] = 0
-        return {'important': True, 'summary': ''}
-
-    # Accumulate token usage: per-watch limit and global monthly budget. Done before parsing
-    # because an unparseable reply was still billed.
-    _check_token_budget(watch, cfg, tokens)
-    watch['llm_last_tokens_used'] = tokens
-    accumulate_global_tokens(datastore, tokens,
-                             input_tokens=input_tokens,
-                             output_tokens=output_tokens,
-                             model=cfg['model'])
+        return _evaluation_result(
+            True, '', 'fail_open', coverage, fitted_diff, cfg.get('model', ''),
+        )
 
     try:
-        result = parse_eval_response(raw)
+        parsed = parse_eval_response(_resp.text)
     except ValueError as e:
         # Empty, truncated or non-JSON reply. Fail open, and do NOT cache it - caching a
         # non-answer used to suppress this change and every identical one after it for good.
         logger.warning(
             f"LLM evaluation for {watch.get('uuid')} returned an unusable reply ({e}) — "
-            f"passing change through as important. Raw reply: {(raw or '')[:200]!r}"
+            f"passing change through as important. Raw reply: {(_resp.text or '')[:200]!r}"
         )
-        return {'important': True, 'summary': ''}
+        record_outcome(operation, datastore, metrics_watch, status='fail_open')
+        return _evaluation_result(
+            True, '', 'fail_open', coverage, fitted_diff, cfg.get('model', ''),
+            finish_reason=_resp.finish_reason, usage_reported=_resp.usage_reported,
+            input_tokens=_resp.input_tokens, output_tokens=_resp.output_tokens,
+            total_tokens=_resp.total_tokens,
+        )
 
-    # Store in cache, keeping only the newest entries - it lives in the watch's JSON.
-    cache = dict(watch.get('llm_evaluation_cache') or {})
-    cache.pop(cache_key, None)
-    cache[cache_key] = result
-    if len(cache) > EVAL_CACHE_MAX_ENTRIES:
-        cache = dict(list(cache.items())[-EVAL_CACHE_MAX_ENTRIES:])
-    watch['llm_evaluation_cache'] = cache
+    status = 'incomplete' if diff_truncated or _resp.finish_reason == 'length' else 'ok'
+    if status == 'incomplete':
+        # A negative result from incomplete input/output is never allowed to suppress
+        # or enter the cache. Passing through is the safe, reviewable outcome.
+        record_outcome(operation, datastore, metrics_watch, status='incomplete')
+        return _evaluation_result(
+            True, parsed.get('summary', ''), 'incomplete', coverage, fitted_diff,
+            cfg.get('model', ''), finish_reason=_resp.finish_reason,
+            usage_reported=_resp.usage_reported, input_tokens=_resp.input_tokens,
+            output_tokens=_resp.output_tokens, total_tokens=_resp.total_tokens,
+        )
+
+    result = _evaluation_result(
+        parsed['important'], parsed['summary'], status, coverage, fitted_diff,
+        cfg.get('model', ''), finish_reason=_resp.finish_reason,
+        usage_reported=_resp.usage_reported, input_tokens=_resp.input_tokens,
+        output_tokens=_resp.output_tokens, total_tokens=_resp.total_tokens,
+    )
+
+    if persist:
+        # Store in cache, keeping only the newest entries - it lives in the watch's JSON.
+        cache = dict(watch.get('llm_evaluation_cache') or {})
+        cache.pop(cache_key, None)
+        cache[cache_key] = result
+        if len(cache) > EVAL_CACHE_MAX_ENTRIES:
+            cache = dict(list(cache.items())[-EVAL_CACHE_MAX_ENTRIES:])
+        watch['llm_evaluation_cache'] = cache
 
     logger.debug(
         f"LLM eval {watch.get('uuid')} (intent from {source}): "
-        f"important={result['important']} tokens={tokens} summary={result['summary'][:80]}"
+        f"important={result['important']} tokens={_resp.total_tokens} summary={result['summary'][:80]}"
     )
     return result

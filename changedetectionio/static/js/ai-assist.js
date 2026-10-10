@@ -22,6 +22,13 @@ $(function () {
         return true;
     }
 
+    function replaceLines(fieldId, values) {
+        const $f = $('#' + fieldId);
+        if (!$f.length) return false;
+        $f.val(values.join('\n')).trigger('change');
+        return true;
+    }
+
     // Tags are a single comma-separated input of group titles.
     function appendTags(values) {
         const $f = $('#tags');
@@ -34,8 +41,9 @@ $(function () {
     }
 
     // One checkbox list per target field, with an "Add selected" button.
-    function renderGroup(field, items, label) {
+    function renderGroup(field, items, label, options) {
         if (!items || !items.length) return null;
+        options = options || {};
         const $g = $('<div class="ai-assist-group">').append($('<strong>').text(label || t[field] || field));
         const $ul = $('<ul style="list-style:none;margin:0.3em 0;padding:0">');
         items.forEach(function (it) {
@@ -59,8 +67,18 @@ $(function () {
         $btn.on('click', function () {
             const values = $ul.find('input:checked').map(function () { return $(this).attr('data-value'); }).get();
             if (!values.length) return;
-            const ok = field === 'tags' ? appendTags(values) : appendLines(field, values);
+            let ok;
+            if (field === 'tags') {
+                ok = appendTags(values);
+            } else if (options.replace) {
+                ok = replaceLines(field, values);
+            } else {
+                ok = appendLines(field, values);
+            }
             $done.text(ok ? (t.added || 'Added') : field + '?');
+            if (ok && options.preview && typeof window.preview_filter_draft === 'function') {
+                window.preview_filter_draft();
+            }
         });
         return $g.append($ul, $btn, ' ', $done);
     }
@@ -80,10 +98,12 @@ $(function () {
                 data.fixes.forEach(f => $ul.append($('<li>').text(f)));
                 $result.append($('<strong>').text(t.fixes || 'Suggested fixes'), $ul);
             }
-            groups.push(renderGroup('include_filters', data.include_filters));
+            groups.push(renderGroup('include_filters', data.include_filters, null, {replace: true, preview: true}));
             if (data.html_note) notes.push(note((t.based_on || 'Based on') + ': ' + data.html_note));
         } else if (kind === 'filters') {
-            ['include_filters', 'subtractive_selectors', 'ignore_text', 'trigger_text'].forEach(f => groups.push(renderGroup(f, data[f])));
+            ['include_filters', 'subtractive_selectors', 'ignore_text', 'trigger_text'].forEach(f => groups.push(
+                renderGroup(f, data[f], null, {preview: true})
+            ));
         } else if (kind === 'noise') {
             groups.push(renderGroup('ignore_text', data.ignore_text));
             if (data.ignore_text && data.ignore_text.length && data.diffs_checked) {
@@ -99,6 +119,10 @@ $(function () {
         shown.forEach(g => $result.append(g));
         notes.forEach(n => $result.append(n));
         if (data.reason) $result.append(note(data.reason));
+        if (data.combined_filter_preview && typeof window.render_filter_preview_analysis === 'function') {
+            window.render_filter_preview_analysis(data.combined_filter_preview);
+            $result.append(note('The combined filter analysis is shown in the Filters & Triggers preview.'));
+        }
     }
 
     $box.on('click', '[data-ai-assist]', function () {
