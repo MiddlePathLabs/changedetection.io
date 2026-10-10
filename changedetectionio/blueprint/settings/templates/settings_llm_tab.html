@@ -447,6 +447,35 @@
     </table>
   </div>
 
+  <p class="stab-section-title">{{ _('Execution health by operation') }}</p>
+  <p class="pure-form-message-inline">
+    {{ _('Execution metrics begin when health tracking became available, independently of older usage counters. Durations include successful and failed provider calls, retries, and backoff, but exclude summary queue wait. Retries count additional attempts made by the application, not retries hidden inside provider libraries. Queue-full counts are rejected requests for distinct summary jobs, not duplicate pending jobs.') }}
+  </p>
+  <div class="llm-usage-table-wrap">
+    <table class="pure-table pure-table-horizontal llm-usage-table">
+      <thead><tr>
+        <th scope="col">{{ _('Operation') }}</th>
+        <th scope="col">{{ _('Measured calls') }}</th>
+        <th scope="col">{{ _('Average duration') }}</th>
+        <th scope="col">{{ _('Longest duration') }}</th>
+        <th scope="col">{{ _('Retried calls / retries') }}</th>
+        <th scope="col">{{ _('Queue full') }}</th>
+      </tr></thead>
+      <tbody>
+      {% for operation, metrics in llm_operation_metrics.items() %}
+      <tr>
+        <th scope="row">{{ operation|replace('_', ' ')|title }}</th>
+        <td>{{ '{:,}'.format(metrics.execution_calls) }}</td>
+        <td>{% if metrics.execution_calls %}{{ _('%(seconds)s s', seconds='%.2f'|format(metrics.execution_seconds / metrics.execution_calls)) }}{% else %}{{ _('Not recorded') }}{% endif %}</td>
+        <td>{% if metrics.execution_calls %}{{ _('%(seconds)s s', seconds='%.2f'|format(metrics.execution_max_seconds)) }}{% else %}{{ _('Not recorded') }}{% endif %}</td>
+        <td>{% if metrics.execution_calls %}{{ '{:,}'.format(metrics.retried_calls) }} / {{ '{:,}'.format(metrics.retries) }}{% else %}{{ _('Not recorded') }}{% endif %}</td>
+        <td>{% if operation == 'summary' %}{{ '{:,}'.format(metrics.queue_saturation) }}{% else %}{{ _('Not applicable') }}{% endif %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
   {% if llm_watch_metrics %}
   <p class="stab-section-title">{{ _('Usage by watch') }}</p>
   <div class="llm-usage-table-wrap">
@@ -456,6 +485,9 @@
         <th scope="col">{{ _('Input / output / total tokens') }}</th>
         <th scope="col">{{ _('Estimated cost') }}</th>
         <th scope="col">{{ _('Fail-open calls') }}</th>
+        <th scope="col">{{ _('Average / longest duration') }}</th>
+        <th scope="col">{{ _('Retried calls / retries') }}</th>
+        <th scope="col">{{ _('Queue full') }}</th>
         <th scope="col">{{ _('Review') }}</th>
       </tr></thead>
       <tbody>
@@ -465,6 +497,9 @@
         <td>{% if item.metrics.values()|selectattr('unknown_usage')|list|length %}{{ _('Unknown') }}{% else %}{{ '{:,}'.format(item.metrics.values()|sum(attribute='input_tokens')) }} / {{ '{:,}'.format(item.metrics.values()|sum(attribute='output_tokens')) }} / {{ '{:,}'.format(item.tokens) }}{% endif %}</td>
         <td>{% set watch_unknown = item.metrics.values()|selectattr('unknown_cost')|list|length or item.metrics.values()|selectattr('unknown_usage')|list|length %}{% if watch_unknown %}{{ _('Unknown') }}{% elif llm_show_costs %}${{ '%.4f'|format(item.cost) }}{% else %}{{ _('Not shown') }}{% endif %}</td>
         <td>{{ item.fail_open }}</td>
+        <td>{% if item.execution_calls %}{{ _('%(average)s / %(longest)s s (%(count)s measured calls)', average='%.2f'|format(item.execution_seconds / item.execution_calls), longest='%.2f'|format(item.execution_max_seconds), count='{:,}'.format(item.execution_calls)) }}{% else %}{{ _('Not recorded') }}{% endif %}</td>
+        <td>{% if item.execution_calls %}{{ '{:,}'.format(item.retried_calls) }} / {{ '{:,}'.format(item.retries) }}{% else %}{{ _('Not recorded') }}{% endif %}</td>
+        <td>{{ '{:,}'.format(item.queue_saturation) }}</td>
         <td><a href="{{ url_for('ui.ui_diff.ai_review', uuid=item.uuid) }}">{{ _('Open AI review') }}</a></td>
       </tr>
       {% endfor %}
@@ -477,7 +512,7 @@
     {{ _('Cache hit rate is live evaluation cache hits divided by recorded evaluation cache lookups. Operations without a lookup denominator are shown as not applicable.') }}
   </p>
   <p class="pure-form-message-inline">
-    {{ _('Live evaluation and summary calls count toward the global and per-watch budgets. Preview, restock extraction, setup assistance, connection tests, and intent replay count only toward the global budget. These are soft limits, so one active call per worker can overshoot a boundary. Latency, retry, and queue-saturation analytics are not recorded unless a future version exposes them.') }}
+    {{ _('Live evaluation and summary calls count toward the global and per-watch budgets. Preview, restock extraction, setup assistance, connection tests, and intent replay count only toward the global budget. These are soft limits, so one active call per worker can overshoot a boundary.') }}
   </p>
 
   {% else %}

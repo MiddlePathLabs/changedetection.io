@@ -22,7 +22,6 @@ from collections import Counter
 
 from loguru import logger
 
-from . import client as llm_client
 from .bm25_trim import trim_to_relevant
 from .diff_text import build_llm_diff
 from .response_parser import parse_json_object
@@ -66,6 +65,7 @@ def _call_json(datastore, system_prompt: str, user_prompt: str) -> dict:
         apply_local_token_multiplier,
         get_llm_settings,
         admit,
+        measured_completion,
         record_outcome,
         record_usage,
         resolve_llm_timeout,
@@ -79,7 +79,7 @@ def _call_json(datastore, system_prompt: str, user_prompt: str) -> dict:
 
     settings = get_llm_settings(datastore)
     try:
-        completion_result = llm_client.completion(
+        completion_result = measured_completion('setup', datastore,
             model=cfg['model'],
             messages=[
                 _cached_system(system_prompt, model=cfg['model']),

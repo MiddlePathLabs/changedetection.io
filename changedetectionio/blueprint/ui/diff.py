@@ -500,6 +500,8 @@ def construct_blueprint(datastore: ChangeDetectionStore):
         except Exception as e:
             from changedetectionio.llm.summary_jobs import SummaryQueueFullError
             if isinstance(e, SummaryQueueFullError):
+                from changedetectionio.llm.evaluator import record_outcome
+                record_outcome('summary', datastore, watch, status='queue_full')
                 return jsonify({
                     'summary': None,
                     'error': 'AI summary queue is full; try again shortly.',

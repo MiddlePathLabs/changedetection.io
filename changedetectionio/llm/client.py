@@ -54,6 +54,11 @@ _EMPTY_LENGTH_RETRY_MULTIPLIER = 4
 _EMPTY_LENGTH_RETRY_MAX_TOKENS = 32_000
 
 
+@dataclass
+class CompletionExecution:
+    attempts: int = 0
+
+
 @dataclass(frozen=True)
 class CompletionResult:
     """The provider response and the usage facts the provider actually returned."""
@@ -149,6 +154,7 @@ def completion(  # noqa: C901
     max_tokens: int = None,
     extra_body: dict = None,
     debug: bool = False,
+    execution: CompletionExecution | None = None,
 ) -> CompletionResult:
     """
     Call the LLM and return a :class:`CompletionResult`.
@@ -224,6 +230,8 @@ def completion(  # noqa: C901
     while attempt < DEFAULT_RETRIES:
         attempt += 1
         try:
+            if execution is not None:
+                execution.attempts += 1
             response = litellm.completion(**kwargs)
             choice = response.choices[0]
             message = choice.message

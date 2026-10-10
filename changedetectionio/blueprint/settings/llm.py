@@ -134,7 +134,6 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
     @login_optionally_required
     def llm_test():
         from flask import request
-        from changedetectionio.llm.client import completion
         from changedetectionio.validate_url import is_llm_api_base_safe
 
         # Pull stored config as the fallback, then override with anything the
@@ -196,7 +195,7 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
             # test even though the same call would succeed in production (issue #4225).
             from changedetectionio.llm.evaluator import (
                 admit, apply_local_token_multiplier, get_llm_settings,
-                record_outcome, record_usage, resolve_llm_timeout,
+                measured_completion, record_outcome, record_usage, resolve_llm_timeout,
             )
             if not admit('connection_test', None, datastore, cfg=llm_cfg):
                 return jsonify({
@@ -204,7 +203,7 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
                     'error': 'Monthly AI token budget reached. Resets next month.',
                     'status': 'budget_exceeded',
                 }), 429
-            completion_result = completion(
+            completion_result = measured_completion('connection_test', datastore,
                 model=model,
                 messages=[{'role': 'user', 'content':
                     'Respond with just the word: ready'}],

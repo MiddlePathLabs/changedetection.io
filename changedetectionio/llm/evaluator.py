@@ -25,6 +25,8 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import Lock
+from time import monotonic
 from loguru import logger
 
 from changedetectionio.strtobool import strtobool
@@ -53,11 +55,15 @@ _METRIC_FIELDS = (
     'dispatched_calls', 'input_tokens', 'output_tokens', 'tokens',
     'estimated_cost_usd', 'unknown_usage', 'unknown_cost',
     'cache_lookups', 'cache_hits', 'fail_open', 'budget_skips', 'incomplete',
+    'execution_calls', 'execution_seconds', 'execution_max_seconds',
+    'provider_attempts', 'retries', 'retried_calls', 'queue_saturation',
 )
+_FLOAT_METRIC_FIELDS = frozenset(('estimated_cost_usd', 'execution_seconds', 'execution_max_seconds'))
+_METRICS_LOCK = Lock()
 
 
 def _empty_metric_bucket() -> dict:
-    return {field: 0.0 if field == 'estimated_cost_usd' else 0 for field in _METRIC_FIELDS}
+    return {field: 0.0 if field in _FLOAT_METRIC_FIELDS else 0 for field in _METRIC_FIELDS}
 
 
 def _normalise_metrics(raw) -> dict:
@@ -69,9 +75,9 @@ def _normalise_metrics(raw) -> dict:
         for field in _METRIC_FIELDS:
             value = bucket.get(field, 0)
             try:
-                clean[field] = float(value) if field == 'estimated_cost_usd' else int(value)
+                clean[field] = float(value) if field in _FLOAT_METRIC_FIELDS else int(value)
             except (TypeError, ValueError):
-                clean[field] = 0.0 if field == 'estimated_cost_usd' else 0
+                clean[field] = 0.0 if field in _FLOAT_METRIC_FIELDS else 0
         metrics[operation] = clean
     return metrics
 
@@ -81,20 +87,56 @@ def normalise_llm_metrics(raw) -> dict:
     return _normalise_metrics(raw)
 
 
+def _record_metrics(datastore, operation: str, amounts: dict, watch=None) -> None:
+    if operation not in LLM_OPERATIONS or any(field not in _METRIC_FIELDS for field in amounts):
+        raise ValueError(f'Unknown LLM metrics: {operation}.{tuple(amounts)}')
+    with _METRICS_LOCK:
+        with datastore.lock:
+            settings = get_llm_settings(datastore)
+            metrics = _normalise_metrics(settings.operation_metrics)
+            buckets = [metrics[operation]]
+            if watch is not None:
+                watch_metrics = _normalise_metrics(watch.get('llm_metrics'))
+                buckets.append(watch_metrics[operation])
+            for bucket in buckets:
+                for field, amount in amounts.items():
+                    if field == 'execution_max_seconds':
+                        bucket[field] = max(bucket[field], amount)
+                    else:
+                        bucket[field] += amount
+            settings.operation_metrics = metrics
+            datastore.data['settings']['application']['llm'] = settings.model_dump()
+            if watch is not None:
+                watch['llm_metrics'] = watch_metrics
+            datastore.commit()
+        # Watch.commit takes the datastore lock itself; serialize metric saves outside it.
+        commit_watch = getattr(watch, 'commit', None)
+        if callable(commit_watch):
+            commit_watch()
+
+
 def _record_metric(datastore, operation: str, field: str, amount=1, watch=None) -> None:
-    if operation not in LLM_OPERATIONS or field not in _METRIC_FIELDS:
-        raise ValueError(f'Unknown LLM metric: {operation}.{field}')
-    with datastore.lock:
-        settings = get_llm_settings(datastore)
-        metrics = _normalise_metrics(settings.operation_metrics)
-        metrics[operation][field] += amount
-        settings.operation_metrics = metrics
-        datastore.data['settings']['application']['llm'] = settings.model_dump()
-        if watch is not None:
-            watch_metrics = _normalise_metrics(watch.get('llm_metrics'))
-            watch_metrics[operation][field] += amount
-            watch['llm_metrics'] = watch_metrics
-        datastore.commit()
+    _record_metrics(datastore, operation, {field: amount}, watch=watch)
+
+
+def measured_completion(operation: str, datastore, watch=None, **kwargs) -> llm_client.CompletionResult:
+    """Measure dispatched completions, including failed calls and retry backoff."""
+    execution = llm_client.CompletionExecution()
+    started = monotonic()
+    try:
+        return llm_client.completion(execution=execution, **kwargs)
+    finally:
+        elapsed = monotonic() - started
+        if execution.attempts:
+            retries = execution.attempts - 1
+            _record_metrics(datastore, operation, {
+                'execution_calls': 1,
+                'execution_seconds': elapsed,
+                'execution_max_seconds': elapsed,
+                'provider_attempts': execution.attempts,
+                'retries': retries,
+                'retried_calls': int(retries > 0),
+            }, watch=watch)
 
 
 def record_outcome(operation: str, datastore, watch=None, status: str = '') -> None:
@@ -104,6 +146,7 @@ def record_outcome(operation: str, datastore, watch=None, status: str = '') -> N
         'fail_open': 'fail_open',
         'budget_exceeded': 'budget_skips',
         'incomplete': 'incomplete',
+        'queue_full': 'queue_saturation',
     }.get(status)
     if field:
         _record_metric(datastore, operation, field, watch=watch)
@@ -124,16 +167,17 @@ def record_usage(operation: str, datastore, watch, completion_result, model: str
             datastore, total, input_tokens=input_tokens,
             output_tokens=output_tokens, model=model,
         )
-    _record_metric(datastore, operation, 'input_tokens', input_tokens, watch=watch)
-    _record_metric(datastore, operation, 'output_tokens', output_tokens, watch=watch)
-    _record_metric(datastore, operation, 'tokens', total, watch=watch)
+    amounts = {
+        'input_tokens': input_tokens, 'output_tokens': output_tokens, 'tokens': total,
+    }
     if not usage_reported:
-        _record_metric(datastore, operation, 'unknown_usage', watch=watch)
+        amounts['unknown_usage'] = 1
     estimated_cost = estimate_cost_usd(model, input_tokens, output_tokens)
     if not usage_reported or estimated_cost is None:
-        _record_metric(datastore, operation, 'unknown_cost', watch=watch)
+        amounts['unknown_cost'] = 1
     elif estimated_cost:
-        _record_metric(datastore, operation, 'estimated_cost_usd', estimated_cost, watch=watch)
+        amounts['estimated_cost_usd'] = estimated_cost
+    _record_metrics(datastore, operation, amounts, watch=watch)
 
 
 def admit(operation: str, watch, datastore, cfg: dict = None) -> bool:
@@ -964,7 +1008,7 @@ def summarise_change(watch, datastore, diff: str, current_snapshot: str = '') ->
     _extra_body = _thinking_extra_body(cfg['model'], settings.thinking_budget)
 
     try:
-        _resp = llm_client.completion(
+        _resp = measured_completion('summary', datastore, watch,
             model=cfg['model'],
             messages=[
                 _cached_system(system_prompt, model=cfg['model']),
@@ -1044,7 +1088,7 @@ def preview_extract(watch, datastore, content: str) -> dict | None:
         }
 
     try:
-        _resp = llm_client.completion(
+        _resp = measured_completion('preview', datastore, watch,
             model=cfg['model'],
             messages=[
                 _cached_system(system_prompt, model=cfg['model']),
@@ -1230,7 +1274,7 @@ def evaluate_change(watch, datastore, diff: str, current_snapshot: str = '', *,
 
     settings = get_llm_settings(datastore)
     try:
-        _resp = llm_client.completion(
+        _resp = measured_completion(operation, datastore, metrics_watch,
             model=cfg['model'],
             messages=[
                 _cached_system(system_prompt, model=cfg['model']),

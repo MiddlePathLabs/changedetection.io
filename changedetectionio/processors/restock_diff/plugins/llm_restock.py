@@ -275,8 +275,7 @@ def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, 
         return None
 
     try:
-        from changedetectionio.llm.evaluator import _runtime_llm_config, admit, get_llm_settings, _get_max_input_chars, _thinking_extra_body, resolve_llm_timeout, record_outcome, record_usage
-        from changedetectionio.llm import client as llm_client
+        from changedetectionio.llm.evaluator import _runtime_llm_config, admit, get_llm_settings, _get_max_input_chars, _thinking_extra_body, measured_completion, resolve_llm_timeout, record_outcome, record_usage
     except ImportError as e:
         logger.debug(f"LLM restock fallback: LLM libraries not available ({e})")
         return None
@@ -333,7 +332,7 @@ def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, 
     logger.debug(f"LLM System Prompt: {SYSTEM_PROMPT}")
     logger.debug(f"LLM Prompt: {user_prompt}")
     try:
-        completion_result = llm_client.completion(
+        completion_result = measured_completion('restock', datastore,
             model=llm_cfg['model'],
             messages=[
                 {'role': 'system', 'content': SYSTEM_PROMPT},

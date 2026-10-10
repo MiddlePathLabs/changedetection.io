@@ -259,10 +259,7 @@ def construct_blueprint(datastore: ChangeDetectionStore):
             _metrics = normalise_llm_metrics(_watch.get('llm_metrics'))
             _tokens = sum(bucket['tokens'] for bucket in _metrics.values())
             _failures = sum(bucket['fail_open'] for bucket in _metrics.values())
-            if _tokens or _failures or any(
-                bucket['dispatched_calls'] or bucket['cache_hits'] or bucket['cache_lookups']
-                for bucket in _metrics.values()
-            ):
+            if any(any(bucket.values()) for bucket in _metrics.values()):
                 llm_watch_metrics.append({
                     'uuid': _watch.get('uuid', ''),
                     'label': _watch.label,
@@ -270,6 +267,12 @@ def construct_blueprint(datastore: ChangeDetectionStore):
                     'tokens': _tokens,
                     'fail_open': _failures,
                     'cost': sum(bucket['estimated_cost_usd'] for bucket in _metrics.values()),
+                    'execution_calls': sum(bucket['execution_calls'] for bucket in _metrics.values()),
+                    'execution_seconds': sum(bucket['execution_seconds'] for bucket in _metrics.values()),
+                    'execution_max_seconds': max(bucket['execution_max_seconds'] for bucket in _metrics.values()),
+                    'retries': sum(bucket['retries'] for bucket in _metrics.values()),
+                    'retried_calls': sum(bucket['retried_calls'] for bucket in _metrics.values()),
+                    'queue_saturation': _metrics['summary']['queue_saturation'],
                 })
         llm_watch_metrics.sort(
             key=lambda item: (item['tokens'], item['fail_open'], item['cost']), reverse=True,

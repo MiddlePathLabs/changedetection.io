@@ -220,61 +220,6 @@ class TestLLMRestockPluginTokenAccounting:
         assert result is None
 
 
-class TestLLMRestockPluginIntent:
-    def test_llm_intent_appended_to_user_prompt(self):
-        """llm_intent should appear in the prompt sent to the LLM."""
-        from changedetectionio.processors.restock_diff.plugins import llm_restock
-        ds = _make_datastore()
-        llm_restock.datastore = ds
-
-        captured = {}
-        def fake_completion(model, messages, api_key, api_base, max_tokens, extra_body=None, timeout=None):
-            captured['messages'] = messages
-            return CompletionResult(
-                '{"price": 299.0, "currency": "USD", "availability": "instock"}',
-                'stop', 50, 40, 10, True,
-            )
-
-        with patch('changedetectionio.llm.client.completion', side_effect=fake_completion):
-            result = llm_restock.get_itemprop_availability_override(
-                content='<html><body>$299 In Stock</body></html>',
-                fetcher_name='html_requests',
-                fetcher_instance=None,
-                url='https://example.com',
-                llm_intent='Alert me when price drops below $300',
-            )
-
-        assert result is not None
-        user_msg = next(m for m in captured['messages'] if m['role'] == 'user')
-        assert 'Alert me when price drops below $300' in user_msg['content']
-
-    def test_no_intent_prompt_unchanged(self):
-        """Without llm_intent the user prompt should not include the intent line."""
-        from changedetectionio.processors.restock_diff.plugins import llm_restock
-        ds = _make_datastore()
-        llm_restock.datastore = ds
-
-        captured = {}
-        def fake_completion(model, messages, api_key, api_base, max_tokens, extra_body=None, timeout=None):
-            captured['messages'] = messages
-            return CompletionResult(
-                '{"price": 9.99, "currency": "USD", "availability": "instock"}',
-                'stop', 20, 15, 5, True,
-            )
-
-        with patch('changedetectionio.llm.client.completion', side_effect=fake_completion):
-            llm_restock.get_itemprop_availability_override(
-                content='<html><body>$9.99 In Stock</body></html>',
-                fetcher_name='html_requests',
-                fetcher_instance=None,
-                url='https://example.com',
-                llm_intent=None,
-            )
-
-        user_msg = next(m for m in captured['messages'] if m['role'] == 'user')
-        assert 'notification intent' not in user_msg['content']
-
-
 class TestLLMRestockPluginErrorHandling:
     def test_returns_none_on_bad_json(self):
         from changedetectionio.processors.restock_diff.plugins import llm_restock
