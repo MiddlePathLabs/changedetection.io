@@ -442,7 +442,7 @@ class TestRestockHookDispatch:
         registered(NotMine())
         llm_restock.datastore = _make_datastore()
         with patch('changedetectionio.llm.client.completion',
-                   return_value=('{"price": 12.5, "currency": "USD", "availability": "instock"}', 50, 40, 10)):
+                   return_value=CompletionResult('{"price": 12.5, "currency": "USD", "availability": "instock"}', 'stop', 50, 40, 10, True)):
             result = self._dispatch()
         assert result['price'] == 12.5
 
@@ -466,7 +466,7 @@ class TestRestockHookDispatch:
         from changedetectionio.processors.restock_diff.plugins import llm_restock
         llm_restock.datastore = _make_datastore()
         with patch('changedetectionio.llm.client.completion',
-                   return_value=('{"price": 12.5, "currency": "USD", "availability": "instock"}', 50, 40, 10)) as completion:
+                   return_value=CompletionResult('{"price": 12.5, "currency": "USD", "availability": "instock"}', 'stop', 50, 40, 10, True)) as completion:
             get_itemprop_availability_from_plugin(self.HTML, 'html_requests', None, 'https://example.com/widget',
                                                   llm_intent='alert below $10')
         assert 'alert below $10' in completion.call_args.kwargs['messages'][-1]['content']

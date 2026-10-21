@@ -201,3 +201,94 @@ html[data-ai-mode="true"] body.llm-configured {
     overflow-wrap: break-word;
   }
 }
+
+// ── AI review queue page ─────────────────────────────────────────────────────
+// The review page lists evaluated diffs (ai-review.html) and the replay view
+// (ai-replay.html) shows the original prompt/result columns side by side.
+
+.ai-review-page {
+  width: 95%;
+  max-width: 72rem;
+  box-sizing: border-box;
+
+  .inner {
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+
+  main { min-width: 0; }
+
+  .ai-review-entry {
+    border-top: 1px solid var(--color-border-table-cell);
+    padding: 1rem 0;
+
+    &:first-child { border-top: 0; }
+  }
+
+  dl {
+    display: grid;
+    grid-template-columns: minmax(8rem, max-content) minmax(0, 1fr);
+    gap: 0.35rem 0.9rem;
+  }
+
+  dt { font-weight: 700; }
+
+  dd {
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  pre.monospace-preview {
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .llm-replay-columns {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1rem;
+
+    > section {
+      min-width: 0;
+      padding: 0.85rem;
+      border: 1px solid var(--color-border-table-cell);
+      border-radius: var(--common-round-border);
+      background: var(--color-table-stripe);
+    }
+  }
+
+  .pure-form {
+    textarea {
+      box-sizing: border-box;
+      max-width: 100%;
+    }
+
+    legend { color: inherit; }
+  }
+}
+
+// Usage table on the LLM settings tab: scroll locally instead of stretching the page.
+.llm-usage-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.llm-usage-table { min-width: 58rem; }
+
+@media only screen and (max-width: 760px) {
+  .ai-review-page {
+    width: 100%;
+
+    .inner { padding: 0.85rem; }
+
+    dl { grid-template-columns: 1fr; }
+
+    .llm-replay-columns { grid-template-columns: 1fr; }
+  }
+
+  .llm-usage-table { min-width: 52rem; }
+}

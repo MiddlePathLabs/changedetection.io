@@ -341,11 +341,11 @@ def parse_restock_reply(raw: str, url: str = None) -> dict | None:
     if price is not None:
         try:
             if isinstance(price, str):
-                # The model sometimes returns the price as page text ("1.299,95 €"), stripping
-                # everything but digits and dots would turn that into 1.29995. Same parser as the
-                # structured-data extractors, see Restock.parse_currency() for every caller.
-                from changedetectionio.processors.restock_diff import Restock
-                price = Restock().parse_currency(price)
+                # The model sometimes returns the price as page text ("1.299,95 €"). A bare
+                # digits-and-dots strip reads that as 1.29995, while Restock.parse_currency()
+                # reads dot-thousands like "1.299" as 1.299 (and drops "1.299.999" entirely) —
+                # _normalise_price handles both separator styles correctly.
+                price = _normalise_price(price)
             else:
                 price = float(price)
         except (ValueError, TypeError):
