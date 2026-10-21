@@ -8,6 +8,32 @@ LLM and asks it to return a structured JSON answer.
 
 The module-level `datastore` variable is injected at startup by
 `inject_datastore_into_plugins()` in pluggy_interface.py.
+
+Reusable by other LLM backends: a plugin that talks to a provider some other way
+(without litellm) can reuse the prompt, page trimming, cache and reply parsing,
+and only supply the HTTP call itself. Register it under the 'changedetectionio' setuptools
+entrypoint; it runs before this one (trylast), and this one is skipped once it answers:
+
+    from changedetectionio.pluggy_interface import hookimpl
+    from changedetectionio.processors.restock_diff.plugins.llm_restock import (
+        build_restock_messages, restock_cache_key, restock_cache_get, restock_cache_put, parse_restock_reply)
+
+    @hookimpl
+    def get_itemprop_availability_override(content, url, llm_intent, text):
+        # `content` is the fetched HTML, `text` the same page through html_to_text().
+        # No default values here, pluggy silently never passes an argument that has one.
+        messages = build_restock_messages(content, url, llm_intent)
+        key = restock_cache_key(MODEL, messages)
+        result = restock_cache_get(key)
+        if result is None:
+            raw = <POST messages to your provider with requests>
+            result = parse_restock_reply(raw, url)
+            if result:
+                restock_cache_put(key, result)
+        return result   # None lets the next plugin try
+
+None of these import litellm. Avoid evaluator._thinking_extra_body(), it does, and
+pass cost_usd= to accumulate_global_tokens() so it doesn't look the price up in litellm.
 """
 import os
 import re
@@ -137,11 +163,16 @@ _LLM_RESULT_CACHE = OrderedDict()
 _LLM_RESULT_CACHE_MAX = 500
 
 
-def _llm_cache_get(key):
+def restock_cache_key(model: str, messages: list) -> str:
+    """Cache key for one extraction - the model plus the exact user prompt sent to it."""
+    return hashlib.md5(((model or '') + '\n' + messages[-1]['content']).encode('utf-8')).hexdigest()
+
+
+def restock_cache_get(key):
     return _LLM_RESULT_CACHE.get(key)
 
 
-def _llm_cache_put(key, value):
+def restock_cache_put(key, value):
     _LLM_RESULT_CACHE[key] = value
     _LLM_RESULT_CACHE.move_to_end(key)
     while len(_LLM_RESULT_CACHE) > _LLM_RESULT_CACHE_MAX:
@@ -265,8 +296,77 @@ def _strip_html(html_content: str, max_chars: int = _MAX_CONTENT_CHARS) -> str:
     return text[:max_chars]
 
 
-@hookimpl
-def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, url, llm_intent=None):
+def build_restock_messages(content: str, url: str, llm_intent: str = None,
+                           max_chars: int = _MAX_CONTENT_CHARS) -> list | None:
+    """Chat messages (system + user) for extracting price/stock from *content* (HTML).
+
+    Returns None when there's no text left after stripping the HTML, nothing worth sending.
+    """
+    text_content = _strip_html(content, max_chars=max_chars) if content else ''
+    logger.debug(f"LLM restock fallback: stripped HTML to {len(text_content)} chars for {url}")
+    if not text_content.strip():
+        logger.debug("LLM restock fallback: no text content after stripping HTML")
+        return None
+
+    user_prompt = f'URL: {url or "unknown"}\n\nPage content:\n{text_content}'
+    if llm_intent:
+        user_prompt += f'\n\nUser notification intent: {llm_intent}'
+
+    return [
+        {'role': 'system', 'content': SYSTEM_PROMPT},
+        {'role': 'user', 'content': user_prompt},
+    ]
+
+
+def parse_restock_reply(raw: str, url: str = None) -> dict | None:
+    """{'price', 'currency', 'availability'} from the model's raw reply.
+
+    Returns None when the reply isn't JSON or carries neither a price nor an availability.
+    """
+    logger.debug(f"LLM restock fallback raw response: {raw!r}")
+
+    # parse_json_object also copes with <think> scratchpads from reasoning models and prose
+    # around the object, which a bare json.loads rejected.
+    try:
+        result = parse_json_object(raw)
+    except ValueError as e:
+        logger.warning(f"LLM restock fallback: JSON parse failed ({e}) - raw response was: {raw!r}")
+        return None
+
+    price = result.get('price')
+    currency = result.get('currency') or None
+    availability = result.get('availability') or None
+
+    # Normalise price to float
+    if price is not None:
+        try:
+            if isinstance(price, str):
+                # The model sometimes returns the price as page text ("1.299,95 €"), stripping
+                # everything but digits and dots would turn that into 1.29995. Same parser as the
+                # structured-data extractors, see Restock.parse_currency() for every caller.
+                from changedetectionio.processors.restock_diff import Restock
+                price = Restock().parse_currency(price)
+            else:
+                price = float(price)
+        except (ValueError, TypeError):
+            logger.warning(f"LLM restock fallback: could not convert price {price!r} to float, ignoring")
+            price = None
+
+    if price is None and not availability:
+        logger.info(f"LLM restock fallback: LLM returned no usable price or availability for {url} (raw: {raw!r})")
+        return None
+
+    logger.info(
+        f"LLM restock fallback result: price={price} currency={currency} "
+        f"availability={availability!r} url={url}"
+    )
+    return {'price': price, 'currency': currency, 'availability': availability}
+
+
+# trylast: plugins that talk to a provider some other way get the first go, and since the
+# hook is firstresult this one (and litellm) is skipped when one of them already answered.
+@hookimpl(trylast=True)
+def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, url, llm_intent):
     """Use an LLM as a last-resort fallback for price and restock extraction."""
     global datastore
 
@@ -294,29 +394,16 @@ def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, 
         return None
 
     # Prompt size obeys the app's "Max input characters" setting (env → datastore → 100k)
-    max_input_chars = _get_max_input_chars(datastore)
-    text_content = _strip_html(content, max_chars=max_input_chars) if content else ''
-    logger.debug(f"LLM restock fallback: stripped HTML to {len(text_content)} chars for {url}")
-    if not text_content.strip():
-        logger.debug("LLM restock fallback: no text content after stripping HTML")
+    messages = build_restock_messages(content, url, llm_intent, max_chars=_get_max_input_chars(datastore))
+    if not messages:
         return None
 
     logger.info(f"LLM restock fallback: using LLM ({llm_cfg['model']}) for price/stock extraction - {url}")
 
-    user_prompt = (
-        f'URL: {url or "unknown"}\n\n'
-        f'<untrusted_page_data name="page_content">\n{text_content}\n</untrusted_page_data>'
-    )
-    if llm_intent:
-        user_prompt += f'\n\nUser notification intent: {llm_intent}'
-
     # Skip the (billed) LLM call entirely if we've already extracted this exact input — the page
     # content that matters hasn't changed since last time, only noisy raw HTML around it.
-    cache_key = hashlib.md5((
-        PROMPT_VERSION + '\x00' + (llm_cfg.get('model') or '') + '\x00'
-        + SYSTEM_PROMPT + '\x00' + user_prompt
-    ).encode('utf-8')).hexdigest()
-    cached = _llm_cache_get(cache_key)
+    cache_key = restock_cache_key(llm_cfg['model'], messages)
+    cached = restock_cache_get(cache_key)
     if cached is not None:
         record_outcome('restock', datastore, status='cached')
         logger.info(f"LLM restock fallback: content unchanged since last LLM call, reusing cached result - {url}")
@@ -330,14 +417,11 @@ def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, 
         return None
 
     logger.debug(f"LLM System Prompt: {SYSTEM_PROMPT}")
-    logger.debug(f"LLM Prompt: {user_prompt}")
+    logger.debug(f"LLM Prompt: {messages[-1]['content']}")
     try:
         completion_result = measured_completion('restock', datastore,
             model=llm_cfg['model'],
-            messages=[
-                {'role': 'system', 'content': SYSTEM_PROMPT},
-                {'role': 'user', 'content': user_prompt},
-            ],
+            messages=messages,
             api_key=llm_cfg.get('api_key'),
             api_base=llm_cfg.get('api_base'),
             timeout=resolve_llm_timeout(llm_cfg),
@@ -358,33 +442,11 @@ def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, 
             record_outcome('restock', datastore, status='incomplete')
             return None
 
-        # Shared parser: copes with markdown fences, <think> scratchpads from reasoning
-        # models and prose around the object, all of which a bare json.loads rejected.
-        result = parse_json_object(completion_result.text)
-
-        price = result.get('price')
-        currency = result.get('currency') or None
-        availability = result.get('availability') or None
-
-        # Normalise price to float
-        if price is not None:
-            try:
-                price = _normalise_price(price)
-            except (ValueError, TypeError):
-                logger.warning(f"LLM restock fallback: could not convert price {price!r} to float, ignoring")
-                price = None
-
-        if price is None and not availability:
-            logger.info(f"LLM restock fallback: LLM returned no usable price or availability for {url} (raw: {completion_result.text!r})")
+        result_clean = parse_restock_reply(completion_result.text, url)
+        if not result_clean:
             return None
-
-        logger.info(
-            f"LLM restock fallback result: price={price} currency={currency} "
-            f"availability={availability!r} url={url}"
-        )
-        result_clean = {'price': price, 'currency': currency, 'availability': availability}
         # Remember this result so an identical next check doesn't re-bill the LLM.
-        _llm_cache_put(cache_key, result_clean)
+        restock_cache_put(cache_key, result_clean)
         return {
             **result_clean,
             '_tokens': completion_result.total_tokens,
@@ -395,11 +457,6 @@ def get_itemprop_availability_override(content, fetcher_name, fetcher_instance, 
             '_prompt_version': PROMPT_VERSION,
         }
 
-    except ValueError as e:
-        record_outcome('restock', datastore, status='fail_open')
-        raw_response = completion_result.text if 'completion_result' in locals() else ''
-        logger.warning(f"LLM restock fallback: JSON parse failed ({e}) - raw response was: {raw_response!r}")
-        return None
     except Exception as e:
         record_outcome('restock', datastore, status='fail_open')
         logger.warning(f"LLM restock fallback: extraction failed for {url}: {e}")
