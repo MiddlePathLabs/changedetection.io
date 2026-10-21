@@ -92,6 +92,29 @@ def max_call_duration(timeout: int) -> int:
     return int(timeout * 2 + backoff)
 
 
+def is_local_llm_endpoint(api_base: str) -> bool:
+    """
+    True when `api_base`'s host is IANA-restricted (private / loopback / link-local /
+    reserved) — i.e. a local or LAN self-hosted LLM (Ollama, vLLM, LM Studio,
+    llama.cpp, ...).
+
+    Reuses the same is_private_hostname check the SSRF guard uses, so DNS names
+    that resolve into the LAN (docker service names, host.docker.internal) count
+    as local too. Empty/cloud api_base → False.
+    """
+    api_base = (api_base or '').strip()
+    if not api_base:
+        return False
+    try:
+        from urllib.parse import urlparse
+        from changedetectionio.validate_url import is_private_hostname
+        host = urlparse(api_base).hostname
+        return bool(host) and is_private_hostname(host)
+    except Exception:
+        # Never let endpoint classification break an LLM call — fall back to "not local".
+        return False
+
+
 def _retry_after_seconds(exc) -> float | None:
     """Retry-After (seconds) from a provider error's response headers, if it sent one."""
     try:
@@ -193,6 +216,16 @@ def completion(  # noqa: C901
         kwargs['api_key'] = api_key
     if api_base:
         kwargs['api_base'] = api_base
+        if not api_key and is_local_llm_endpoint(api_base):
+            # Keyless local endpoint (llama.cpp / vLLM / LM Studio on the LAN). Two problems
+            # with just omitting the key: the OpenAI client refuses to build without a
+            # credential, and a placeholder token ("Bearer anonymous") is rejected by servers
+            # that validate whatever token they are handed. A tokenless "Bearer" satisfies
+            # both — the SDK sees a key, servers that check tokens see an anonymous request,
+            # and servers without auth ignore the header entirely.
+            kwargs['api_key'] = 'local-endpoint-no-key'
+            kwargs['extra_headers'] = {'Authorization': 'Bearer'}
+            logger.debug(f"LLM client: keyless local endpoint {api_base!r} — sending tokenless Bearer")
     if extra_body:
         # Copied: the 400-retry path below strips keys out of it in place.
         kwargs['extra_body'] = copy.deepcopy(extra_body)

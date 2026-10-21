@@ -1335,7 +1335,7 @@ msgid "No API key needed for local Ollama"
 msgstr "本地 Ollama 不需要 API 金鑰"
 
 #: changedetectionio/blueprint/settings/templates/settings_llm_tab.html
-msgid "Bearer token for your self-hosted server (vLLM, LM Studio, etc.)"
+msgid "Bearer token for your self-hosted server (vLLM, LM Studio, etc.) — leave blank for keyless LAN/local endpoints"
 msgstr "您自行架設伺服器的 Bearer 權杖（vLLM、LM Studio 等）"
 
 #: changedetectionio/blueprint/settings/templates/settings_llm_tab.html

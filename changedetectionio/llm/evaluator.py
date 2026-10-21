@@ -468,17 +468,7 @@ def _is_local_llm_endpoint(llm_cfg: dict) -> bool:
     service names (`http://ollama:11434`), `host.docker.internal`, and bare LAN
     IPs are all recognised. No api_base (cloud providers) → False.
     """
-    api_base = ((llm_cfg or {}).get('api_base') or '').strip()
-    if not api_base:
-        return False
-    try:
-        from urllib.parse import urlparse
-        from changedetectionio.validate_url import is_private_hostname
-        host = urlparse(api_base).hostname
-        return bool(host) and is_private_hostname(host)
-    except Exception:
-        # Never let timeout resolution break an LLM call — fall back to "not local".
-        return False
+    return llm_client.is_local_llm_endpoint((llm_cfg or {}).get('api_base') or '')
 
 
 def resolve_llm_timeout(llm_cfg: dict) -> int:

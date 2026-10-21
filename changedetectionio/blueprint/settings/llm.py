@@ -49,6 +49,54 @@ def _humanize_litellm_error(raw: str) -> str:
     return cleaned[:500]
 
 
+def _keyless_local_ok(api_base: str) -> bool:
+    """True for LAN/loopback endpoints, which commonly run without an API key.
+
+    The credential guards below exist to stop the operator's stored provider key
+    being shipped to a third-party URL. A keyless request to a private-address
+    endpoint has nothing to leak, so it is allowed through.
+    """
+    from changedetectionio.llm.client import is_local_llm_endpoint
+    return is_local_llm_endpoint(api_base)
+
+
+def _fetch_openai_compatible_models_keyless(api_base: str):
+    """GET {origin}/v1/models with no Authorization header (same URL rule litellm's
+    OpenAI provider uses: path is dropped, /v1/models is appended)."""
+    import requests
+    from urllib.parse import urlparse
+
+    parsed = urlparse(api_base)
+    origin = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port:
+        origin += f":{parsed.port}"
+    url = f"{origin}/v1/models"
+
+    try:
+        r = requests.get(url, timeout=30)
+    except Exception as e:
+        logger.warning(f"LLM model list (keyless local) request failed for {url!r}: {e}")
+        return jsonify({'models': [], 'error': str(e)}), 400
+
+    if r.status_code != 200:
+        try:
+            msg = (r.json().get('error') or {}).get('message') or r.text
+        except Exception:
+            msg = r.text
+        logger.warning(f"LLM model list (keyless local) {url!r} returned {r.status_code}: {msg}")
+        return jsonify({'models': [], 'error': str(msg)[:500]}), 400
+
+    try:
+        raw = [m['id'] for m in r.json()['data']]
+    except Exception as e:
+        logger.warning(f"LLM model list (keyless local) {url!r}: unexpected payload: {e}")
+        return jsonify({'models': [], 'error': f"Unexpected response: {e}"}), 400
+
+    models = sorted({'openai/' + m for m in raw})
+    logger.debug(f"LLM model list (keyless local): got {len(models)} models from {url!r}")
+    return jsonify({'models': models, 'error': None})
+
+
 def construct_llm_blueprint(datastore: ChangeDetectionStore):
     llm_blueprint = Blueprint('llm', __name__)
 
@@ -84,7 +132,7 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
             if api_base == stored_api_base:
                 api_key = (stored_llm.get('api_key') or '')
                 logger.debug("LLM model list: no api_key in request, using stored key (api_base matches saved)")
-            elif api_base:
+            elif api_base and not _keyless_local_ok(api_base):
                 logger.warning("LLM model list refused: api_base differs from saved config but no api_key supplied")
                 return jsonify({'models': [], 'error': gettext(
                     "api_key is required when api_base differs from the saved configuration. "
@@ -98,6 +146,13 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
         _LITELLM_PROVIDER = {'openai_compatible': 'openai'}
         prefix = _PREFIXES.get(provider, '')
         litellm_provider = _LITELLM_PROVIDER.get(provider, provider)
+
+        # Keyless LAN endpoint: litellm's model listing always attaches an Authorization
+        # header, and token-validating servers reject the placeholder it sends for a
+        # missing key ("Invalid token payload"). Fetch the OpenAI-compatible model list
+        # directly, with no auth header at all.
+        if provider == 'openai_compatible' and not api_key and _keyless_local_ok(api_base):
+            return _fetch_openai_compatible_models_keyless(api_base)
 
         try:
             import litellm
@@ -175,7 +230,10 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
         # did NOT supply a matching api_key, refuse to substitute the stored key.
         # Otherwise a CSRF / unauthenticated request can route the operator's
         # long-lived provider key to an attacker-controlled endpoint.
-        if req_api_base and req_api_base != stored_api_base and not req_api_key:
+        # Keyless local (RFC1918 / loopback) endpoints are exempt: there is no key
+        # to send, and LAN servers commonly run without authentication.
+        if req_api_base and req_api_base != stored_api_base and not req_api_key \
+                and not _keyless_local_ok(req_api_base):
             logger.warning("LLM connection test refused: api_base differs from saved config but no api_key supplied")
             return jsonify({'ok': False, 'error': gettext(
                 "api_key is required when api_base differs from the saved configuration. "
