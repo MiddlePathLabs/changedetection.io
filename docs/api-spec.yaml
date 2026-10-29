@@ -108,8 +108,10 @@ tags:
       
   - name: System Information
     description: |
-      Retrieve system status and statistics about your changedetection.io instance, including total watch
-      counts, uptime information, and version details.
+      Retrieve system status and statistics about your changedetection.io instance, including queue size, 
+      overdue checks, total watch and tag counts, uptime metrics, global pause/mute states, update 
+      availability, application version details, and base URL configuration.
+
 
   - name: Plugin API Extensions
     description: |
@@ -171,6 +173,18 @@ tags:
       The `paths` section in `api.yaml` is used only for injecting additional `x-code-samples` into
       existing endpoints — you cannot define new routes via plugin.
 
+      #### Processor state: `processor_state_<processor_name>`
+
+      A processor can also report what its most recent check found (for example the current price),
+      as a read-only `processor_state_<processor_name>` field on `GET /watch/{uuid}` and on each item
+      of `GET /watch`. Implement the `get_api_watch_processor_state(watch, processor_name, context)`
+      pluggy hook and return a dict (or `None` when `processor_name` isn't yours) - core always picks
+      the field name. Document its shape as a `processor_state_<processor_name>` schema in the same
+      `api.yaml`, it is merged into the Watch schema as read-only.
+
+      `processor_config_<processor_name>` (and `processor_config_<processor_name>_source`) is only
+      returned on `GET /watch/{uuid}`, not in the watch list.
+
       ---
 
       ### Built-in plugin: `restock_diff`
@@ -208,7 +222,9 @@ tags:
 
       #### READ — Retrieve the monitor
 
-      The response JSON includes `processor_config_restock_diff` alongside all standard watch fields:
+      The response JSON includes the resolved `processor_config_restock_diff` and the current
+      `processor_state_restock_diff` (stock and price from the most recent check) alongside all
+      standard watch fields. `GET /watch` includes `processor_state_restock_diff` for each restock watch too.
 
       ```bash
       curl -X GET "http://localhost:5000/api/v1/watch/cc0cfffa-f449-477b-83ea-0caafd1dc091" \
@@ -226,6 +242,13 @@ tags:
           "price_change_threshold_percent": 5,
           "price_change_min": null,
           "price_change_max": null
+        },
+        "processor_config_restock_diff_source": "watch",
+        "processor_state_restock_diff": {
+          "in_stock": true,
+          "price": 19.99,
+          "currency": "USD",
+          "last_price": 24.99
         }
       }
       ```
@@ -440,7 +463,9 @@ components:
           type: string
           enum: [restock_diff, text_json_diff]
           default: text_json_diff
-          description: Optional processor mode to use for change detection. Defaults to `text_json_diff` if not specified.
+          description: |
+            Optional processor mode to use for change detection. Defaults to `text_json_diff` if not specified.
+            This static list only shows the built-ins, the live spec at `/api/v1/full-spec` lists every installed processor (including plugin processors).
 
         # Content Filtering
         include_filters:
@@ -921,18 +946,43 @@ components:
     SystemInfo:
       type: object
       properties:
+        queue_size:
+          type: integer
+          default: 0
+          description: Total number of elements in queue
+        overdue_watches:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: All watches which have not been checked but should have been
         watch_count:
           type: integer
           description: Total number of web page change monitors (watches)
         tag_count:
           type: integer
           description: Total number of tags
+        all_paused:
+          type: boolean
+          default: false
+          description: Whether the web page change monitor (watch) is paused globally across all watches
+        all_muted:
+          type: boolean
+          default: false
+          description: Whether notifications are muted globally across all watches
+        base_url:
+          type: string
+          description: Base URL of your changedetection.io installation
         uptime:
           type: string
           description: System uptime
         version:
           type: string
           description: Application version
+        new_version_available:
+          type: boolean
+          default: false
+          description: A newer version of changedetection.io is available for update
 
     SearchResult:
       type: object
@@ -979,7 +1029,13 @@ paths:
       parameters:
         - name: recheck_all
           in: query
-          description: Set to 1 to force recheck of all watches
+          description: Set to 1 to force recheck of all watches matching the other filters (`tag`, `with_errors`). Paused watches are never rechecked.
+          schema:
+            type: string
+            enum: ["1"]
+        - name: with_errors
+          in: query
+          description: Set to 1 to only return watches whose last check ended in an error, combine with `recheck_all=1` to recheck only those
           schema:
             type: string
             enum: ["1"]
@@ -2266,10 +2322,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/SystemInfo'
               example:
+                queue_size: 0
+                overdue_watches: ["cc0cfffa-f449-477b-83ea-0caafd1dc091", "14a10ae3-65b5-5cfc-ab6a-97c331f1c30f", "e980dbd0-f825-4002-b82f-3925b3221188"]
                 watch_count: 42
                 tag_count: 5
+                all_paused: false
+                all_muted: false
+                base_url: "http://localhost:5000/"
                 uptime: "2 days, 3:45:12"
-                version: "0.50.10"
+                version: "0.60.9"
+                new_version_available: true
 
   /full-spec:
     get:

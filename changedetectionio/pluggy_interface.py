@@ -1,14 +1,34 @@
 import pluggy
 import os
 import importlib
+import inspect
 import sys
+import threading
+import time
+from functools import wraps
 from loguru import logger
 
 # Global plugin namespace for changedetection.io
 PLUGIN_NAMESPACE = "changedetectionio"
 
+# Conditions plugins used to have their own PluginManager under this name. Their hooks now live on
+# the main manager, but implementations marked with the old namespace are still picked up (see
+# ChangeDetectionPluginManager.parse_hookimpl_opts) and the old entry-point group is still loaded.
+LEGACY_CONDITIONS_NAMESPACE = "changedetectionio_conditions"
+
 hookspec = pluggy.HookspecMarker(PLUGIN_NAMESPACE)
-hookimpl = pluggy.HookimplMarker(PLUGIN_NAMESPACE)
+# The marker lives in plugin_api (the public plugin module), see the comment there
+from changedetectionio.plugin_api import hookimpl
+
+# A plugin that raises is logged and counted, and the hook carries on with the other plugins.
+# After this many failures in a row the plugin is reported as "errored" (it is still called).
+PLUGIN_CONSECUTIVE_FAILURES_ERRORED = int(os.getenv('PLUGIN_CONSECUTIVE_FAILURES_ERRORED', 5))
+# Upper bound for an async hook implementation, so a hung plugin can't stall a check forever.
+PLUGIN_ASYNC_HOOK_TIMEOUT = float(os.getenv('PLUGIN_ASYNC_HOOK_TIMEOUT', 120))
+
+# Hooks whose exceptions must reach the caller (after being logged and counted), for example a
+# future fetch hook that raises EmptyReply on purpose. Every other hook swallows plugin exceptions.
+HOOKS_THAT_PROPAGATE_EXCEPTIONS = set()
 
 
 class ChangeDetectionSpec:
@@ -40,14 +60,20 @@ class ChangeDetectionSpec:
 
     @hookspec
     def fetcher_status_icon(fetcher_name):
-        """Return status icon HTML attributes for a content fetcher.
+        """Return the status icon shown in the watch list for a content fetcher.
 
         Args:
             fetcher_name: The name of the fetcher (e.g., 'html_webdriver', 'html_js_zyte')
 
         Returns:
-            str: HTML string containing <img> tags or other status icon elements
-                 Empty string if no custom status icon is needed
+            dict or None: None if fetcher_name isn't yours, otherwise
+                {
+                    'filename': 'my-icon.svg',  # served from the static 'group' below
+                    'alt': 'Alt text',
+                    'title': 'Tooltip text',
+                    'group': 'plugin',          # optional, 'plugin' = your plugin_static_path() directory
+                    'style': 'height: 1em;',    # optional inline CSS
+                }
         """
         pass
 
@@ -245,15 +271,207 @@ class ChangeDetectionSpec:
         """
         pass
 
+    @hookspec
+    def watch_list_extra_text(watch):
+        """Short plain-text notes shown under the watch in the watch list (class extra-watch-text).
+
+        This runs for every watch on every watch list render, so stay in memory: no disk,
+        network or other slow work.
+
+        Args:
+            watch: The Watch model instance
+
+        Returns:
+            str, a list of str, or None. Escaped when rendered, so HTML shows as text.
+        """
+        pass
+
+    @hookspec(firstresult=True)
+    def get_api_watch_processor_state(watch, processor_name, context):
+        """Return the current processor state of a watch for the REST API.
+
+        Core calls this with the watch's own processor name and adds your dict to the response
+        as `processor_state_{processor_name}` on:
+        - GET /api/v1/watch/<uuid>  (context='get')
+        - GET /api/v1/watch         (context='list', called once per watch in the listing)
+
+        You never pick the key, core does, so a plugin can't overwrite other watch fields.
+        Return None when processor_name isn't yours, the first non-None result wins.
+
+        Document the shape as components.schemas.processor_state_{processor_name} in your
+        processor's api.yaml, it is merged into the Watch schema as read-only.
+
+        With context='list' this runs for every watch on every listing, so stay in memory:
+        no disk, network or other slow work.
+
+        @IMPORTANT-TODO: where a processor keeps this state on the watch has no convention yet,
+        see store update_watch().
+
+        Example (the built-in restock_diff processor):
+            @hookimpl
+            def get_api_watch_processor_state(watch, processor_name, context):
+                if processor_name != 'restock_diff':
+                    return None
+                restock = watch.get('restock') or {}
+                return {'in_stock': restock.get('in_stock'), 'price': restock.get('price')}
+
+        Args:
+            watch: The Watch model instance
+            processor_name: The watch's processor, e.g. 'restock_diff'
+            context: 'get' or 'list'
+
+        Returns:
+            dict or None: JSON-serialisable state for this watch, or None
+        """
+        pass
+
+    # --- Conditions (JSON Logic rules on the watch edit page) ---
+
+    @hookspec
+    def register_operators():
+        """Return a dict of extra JSON Logic operators, {"operator_name": callable}."""
+        pass
+
+    @hookspec
+    def register_operator_choices():
+        """Return a list of (operator_name, label) tuples to offer in the conditions UI."""
+        pass
+
+    @hookspec
+    def register_field_choices():
+        """Return a list of (field_name, label) tuples to offer in the conditions UI."""
+        pass
+
+    @hookspec
+    def add_data(current_watch_uuid, application_datastruct, ephemeral_data):
+        """Return a dict of extra facts the conditions are evaluated against.
+
+        Each implementation is given 10 seconds, see conditions.execute_ruleset_against_all_plugins().
+        """
+        pass
+
+
+_plugin_health = {}
+_plugin_health_lock = threading.Lock()
+
+
+def _record_hook_success(plugin_name):
+    with _plugin_health_lock:
+        health = _plugin_health.get(plugin_name)
+        if health:
+            health['consecutive_failures'] = 0
+
+
+def _record_hook_failure(plugin_name, hook_name, exception):
+    with _plugin_health_lock:
+        health = _plugin_health.setdefault(plugin_name, {'consecutive_failures': 0, 'total_failures': 0})
+        health['consecutive_failures'] += 1
+        health['total_failures'] += 1
+        health['last_hook'] = hook_name
+        health['last_error'] = f"{type(exception).__name__}: {exception}"
+        health['last_error_time'] = time.time()
+    logger.opt(exception=exception).error(f"Plugin '{plugin_name}' raised in hook '{hook_name}': {exception}")
+
+
+def get_plugin_health(plugin_name=None):
+    """Failure counters per plugin, {name: {'consecutive_failures', 'total_failures', 'last_hook',
+    'last_error', 'last_error_time', 'errored'}}. Plugins that never failed are not listed."""
+    with _plugin_health_lock:
+        snapshot = {name: dict(h, errored=h['consecutive_failures'] >= PLUGIN_CONSECUTIVE_FAILURES_ERRORED)
+                    for name, h in _plugin_health.items()}
+    if plugin_name is not None:
+        return snapshot.get(plugin_name)
+    return snapshot
+
+
+def _isolate_hookimpl(function, plugin_name, hook_name):
+    """Wrap one hook implementation so its exceptions are logged and counted instead of breaking
+    the hook call (and with it the check, page or worker that made it).
+
+    pluggy calls hookimpl.function(*args) with the arguments the implementation declared, and it
+    has already read those names (HookImpl.argnames) from the original function, so the wrapper
+    only has to pass everything through.
+    """
+    propagate = hook_name in HOOKS_THAT_PROPAGATE_EXCEPTIONS
+
+    if inspect.iscoroutinefunction(function):
+        import asyncio
+
+        @wraps(function)
+        async def isolated_async(*args, **kwargs):
+            try:
+                result = await asyncio.wait_for(function(*args, **kwargs), timeout=PLUGIN_ASYNC_HOOK_TIMEOUT)
+            except Exception as e:
+                _record_hook_failure(plugin_name, hook_name, e)
+                if propagate:
+                    raise
+                return None
+            _record_hook_success(plugin_name)
+            return result
+
+        return isolated_async
+
+    @wraps(function)
+    def isolated(*args, **kwargs):
+        try:
+            result = function(*args, **kwargs)
+        except Exception as e:
+            _record_hook_failure(plugin_name, hook_name, e)
+            if propagate:
+                raise
+            return None
+        _record_hook_success(plugin_name)
+        return result
+
+    return isolated
+
+
+class ChangeDetectionPluginManager(pluggy.PluginManager):
+    """pluggy.PluginManager with failure isolation and the legacy conditions hookimpl marker."""
+
+    _warned_legacy_marker = set()
+
+    def parse_hookimpl_opts(self, plugin, name):
+        opts = super().parse_hookimpl_opts(plugin, name)
+        if opts is None:
+            method = getattr(plugin, name, None)
+            if inspect.isroutine(method):
+                legacy = getattr(method, LEGACY_CONDITIONS_NAMESPACE + "_impl", None)
+                if isinstance(legacy, dict):
+                    plugin_label = getattr(plugin, '__name__', type(plugin).__name__)
+                    if plugin_label not in self._warned_legacy_marker:
+                        self._warned_legacy_marker.add(plugin_label)
+                        logger.warning(f"Plugin '{plugin_label}' uses the deprecated "
+                                       f"HookimplMarker('{LEGACY_CONDITIONS_NAMESPACE}'), "
+                                       f"use 'from changedetectionio.plugin_api import hookimpl' instead")
+                    opts = dict(legacy)
+        return opts
+
+    def register(self, plugin, name=None):
+        plugin_name = super().register(plugin, name)
+        if plugin_name is None:
+            return None
+        for hook_caller in self.get_hookcallers(plugin) or []:
+            for impl in hook_caller.get_hookimpls():
+                # Wrappers are generators that pluggy drives itself, leave them alone
+                if impl.plugin is plugin and not (impl.wrapper or impl.hookwrapper):
+                    impl.function = _isolate_hookimpl(impl.function, plugin_name, hook_caller.name)
+        return plugin_name
+
 
 # Set up Plugin Manager
-plugin_manager = pluggy.PluginManager(PLUGIN_NAMESPACE)
+plugin_manager = ChangeDetectionPluginManager(PLUGIN_NAMESPACE)
 
 # Register hookspecs
 plugin_manager.add_hookspecs(ChangeDetectionSpec)
 
 # Load plugins from subdirectories
 def load_plugins_from_directories():
+    # The built-in conditions operators (starts_with, length_min, ...), first so its choices lead the lists
+    from changedetectionio.conditions import default_plugin
+    if not plugin_manager.is_registered(default_plugin):
+        plugin_manager.register(default_plugin, 'conditions_default_plugin')
+
     # List of (python_package_prefix, filesystem_path) pairs to scan for plugins.
     # NOTE: processors/restock_diff/plugins is intentionally excluded here — those
     # plugins are registered via register_builtin_restock_plugins() to avoid the
@@ -282,11 +500,14 @@ def load_plugins_from_directories():
                 except (ImportError, AttributeError) as e:
                     print(f"Error loading plugin {module_name}: {e}")
 
+
 # Load plugins
 load_plugins_from_directories()
 
 # Discover installed plugins from external packages (if any)
 plugin_manager.load_setuptools_entrypoints(PLUGIN_NAMESPACE)
+# Conditions plugins published before the hook namespaces were merged
+plugin_manager.load_setuptools_entrypoints(LEGACY_CONDITIONS_NAMESPACE)
 
 # Function to inject datastore into plugins that need it
 def inject_datastore_into_plugins(datastore):
@@ -337,8 +558,8 @@ def register_builtin_fetchers():
 def register_builtin_restock_plugins():
     """Register built-in restock processor plugins after all imports are complete.
 
-    Called from content_fetchers/__init__.py alongside register_builtin_fetchers()
-    to avoid the circular import that occurs when loading via load_plugins_from_directories()
+    Only called from changedetectionio.main() (so not when the app is built directly, e.g. in tests),
+    deferred to avoid the circular import that occurs when loading via load_plugins_from_directories()
     (restock_diff/__init__.py → model.Watch → content_fetchers → pluggy_interface).
     """
     import importlib
@@ -350,6 +571,32 @@ def register_builtin_restock_plugins():
             logger.debug("Registered built-in restock plugin: llm_restock")
     except Exception as e:
         logger.error(f"Failed to register llm_restock plugin: {e}")
+
+
+def register_builtin_api_plugins():
+    """Register the built-in get_api_watch_processor_state implementations.
+
+    Called from flask_app.changedetection_app() where the API resources are set up, so it runs
+    however the app is started. Can't happen at module load for the same circular import reason
+    as register_builtin_restock_plugins().
+    """
+    from changedetectionio.processors.restock_diff.plugins import api_state
+    if not plugin_manager.is_registered(api_state):
+        # 'builtin_' names are hidden from the active plugins list, see get_active_plugins()
+        plugin_manager.register(api_state, 'builtin_restock_api_state')
+
+def collect_watch_list_extra_text(watch):
+    """All plugins' notes for this watch in the watch list, as a list of strings."""
+    notes = []
+    try:
+        for result in reversed(plugin_manager.hook.watch_list_extra_text(watch=watch)):
+            if not result:
+                continue
+            notes.extend([result] if isinstance(result, str) else [str(r) for r in result if r])
+    except Exception as e:
+        logger.error(f"watch_list_extra_text failed: {e}")
+    return notes
+
 
 # Helper function to collect UI stats extras from all plugins
 def collect_ui_edit_stats_extras(watch):

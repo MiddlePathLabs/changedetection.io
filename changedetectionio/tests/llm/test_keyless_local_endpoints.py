@@ -5,8 +5,8 @@ LAN self-hosted servers (llama.cpp, vLLM, LM Studio, ...) commonly run without a
 API key, but litellm's OpenAI path always attaches an Authorization header — and
 token-validating servers reject the placeholder sent for a missing key with
 "Invalid token payload". The client therefore swaps a keyless local call to a
-tokenless "Bearer", and the settings model listing fetches /v1/models directly
-with no auth header at all.
+tokenless "Bearer", and the settings model listing (model_list.list_models) sends
+no auth header at all.
 """
 
 from types import SimpleNamespace
@@ -79,45 +79,27 @@ class TestKeylessCompletionHeader:
 
 
 class TestKeylessModelsFetch:
+    # Model listing goes through model_list.list_models(), which only sends an
+    # Authorization header when a key was given.
     def _call(self, api_base='http://192.168.40.56:8888/v1', status=200, payload=None):
-        from changedetectionio.blueprint.settings import llm as llm_blueprint
-        from flask import Flask
-        app = Flask(__name__)
-        with app.test_request_context():
-            with patch('requests.get') as mock_get:
-                mock_get.return_value = SimpleNamespace(
-                    status_code=status,
-                    json=lambda: payload if payload is not None else
-                        {'data': [{'id': 'my-model'}, {'id': 'vendor/other-model'}]},
-                    text='server said no',
-                )
-                response = llm_blueprint._fetch_openai_compatible_models_keyless(api_base)
-        # Success returns a bare Response; failures return a (response, status) tuple.
-        if isinstance(response, tuple):
-            self.last_body, self.last_status = response[0].json, response[1]
-        else:
-            self.last_body, self.last_status = response.json, 200
-        return response, mock_get
+        from changedetectionio.llm.model_list import list_models
+        with patch('requests.get') as mock_get:
+            mock_get.return_value = SimpleNamespace(
+                status_code=status,
+                json=lambda: payload if payload is not None else
+                    {'data': [{'id': 'my-model'}, {'id': 'vendor/other-model'}]},
+                text='server said no',
+            )
+            return list_models('openai_compatible', api_key=None, api_base=api_base), mock_get
 
-    def test_fetches_origin_v1_models_without_auth(self):
-        response, mock_get = self._call()
+    def test_fetches_v1_models_without_auth(self):
+        models, mock_get = self._call()
         args, kwargs = mock_get.call_args
-        # Same URL rule litellm uses: drop any path, always /v1/models.
         assert args[0] == 'http://192.168.40.56:8888/v1/models'
         assert not kwargs.get('headers'), "no Authorization header may be sent"
-        assert self.last_body['models'] == ['openai/my-model', 'openai/vendor/other-model']
-        assert self.last_status == 200
-
-    def test_strips_user_supplied_path(self):
-        response, mock_get = self._call(api_base='http://10.0.0.5:9000/custom/prefix')
-        assert mock_get.call_args.args[0] == 'http://10.0.0.5:9000/v1/models'
+        assert models == ['openai/my-model', 'openai/vendor/other-model']
 
     def test_error_payload_is_surfaced(self):
-        self._call(status=401, payload={'error': {'message': 'Invalid token payload'}})
-        assert self.last_status == 400
-        assert 'Invalid token payload' in self.last_body['error']
-
-    def test_unexpected_shape_is_reported(self):
-        self._call(payload={'unexpected': True})
-        assert self.last_status == 400
-        assert 'Unexpected response' in self.last_body['error']
+        from changedetectionio.llm.model_list import ModelListError
+        with pytest.raises(ModelListError, match='Invalid token payload'):
+            self._call(status=401, payload={'error': {'message': 'Invalid token payload'}})

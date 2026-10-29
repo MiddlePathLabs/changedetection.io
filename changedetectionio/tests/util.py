@@ -13,6 +13,29 @@ import threading
 _test_endpoint_content_lock = threading.Lock()
 _test_endpoint_content = {}
 
+def import_example_plugin(example_dir, package):
+    """Import an example_plugins/<example_dir> package as its own top-level package, the way
+    `pip install .` makes it importable, e.g. import_example_plugin('processor/wordcounter', 'cdio_example_wordcounter')"""
+    import importlib
+    import sys
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'example_plugins', example_dir))
+    sys.path.insert(0, path)
+    try:
+        return importlib.import_module(package)
+    finally:
+        sys.path.remove(path)
+
+
+def clear_plugin_discovery_caches():
+    """Processor discovery and the merged API spec are cached at first use, a plugin registered
+    afterwards (like in a test) is only seen once these are cleared."""
+    from changedetectionio import processors, api
+    for f in (processors.find_processors, processors.get_plugin_processor_metadata, processors._available_processors_cached,
+              api.build_merged_spec_dict, api.get_openapi_spec, api.get_openapi_schema_dict,
+              api._resolve_schema_properties, api.get_watch_schema_properties, api.get_tag_schema_properties):
+        f.cache_clear()
+
+
 def write_test_file_and_sync(filepath, content, mode='w'):
     """
     Write test data to file and ensure it's synced to disk.
@@ -158,6 +181,17 @@ def extract_UUID_from_client(client):
     m = re.search('edit/(.+?)[#"]', str(res.data))
     uuid = m.group(1)
     return uuid.strip()
+
+
+def get_form_field(html, name):
+    """Return the <input>, <select> or <textarea> named `name` in the page, or None.
+
+    Use this to assert a field's value (field['value'], field.has_attr('checked')) instead of matching raw
+    bytes like b'type="text" value="5"', which breaks on attribute order, quoting or a changed input type
+    (WTForms 3.3 renders FloatField as type="number"). Keep raw byte checks where the escaping is the point.
+    """
+    from bs4 import BeautifulSoup
+    return BeautifulSoup(html, 'html.parser').find(['input', 'select', 'textarea'], attrs={'name': name})
 
 def delete_all_watches(client=None):
     wait_for_all_checks(client)

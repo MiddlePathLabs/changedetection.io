@@ -119,12 +119,18 @@ def _record_metric(datastore, operation: str, field: str, amount=1, watch=None) 
     _record_metrics(datastore, operation, {field: amount}, watch=watch)
 
 
-def measured_completion(operation: str, datastore, watch=None, **kwargs) -> llm_client.CompletionResult:
-    """Measure dispatched completions, including failed calls and retry backoff."""
+def measured_completion(operation: str, datastore, watch=None, isolated: bool = False,
+                        **kwargs) -> llm_client.CompletionResult:
+    """Measure dispatched completions, including failed calls and retry backoff.
+
+    isolated=True runs the call via completion_isolated() (one-off calls such as the
+    settings connection test, which shouldn't leave litellm resident).
+    """
     execution = llm_client.CompletionExecution()
     started = monotonic()
+    _completion = llm_client.completion_isolated if isolated else llm_client.completion
     try:
-        return llm_client.completion(execution=execution, **kwargs)
+        return _completion(execution=execution, **kwargs)
     finally:
         elapsed = monotonic() - started
         if execution.attempts:

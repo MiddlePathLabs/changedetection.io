@@ -567,6 +567,13 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
                         self.__data['watching'][uuid][dict_key].update(update_obj[dict_key])
                         del (update_obj[dict_key])
 
+            # @IMPORTANT-TODO: processors have no storage of their own for what a check found, whatever
+            # they return in update_obj is merged straight into the watch here (e.g. watch['restock']).
+            # Those keys then leak into the raw API GET dict and fail a GET -> PUT round trip as unknown
+            # fields, unless core hardcodes them (SYSTEM_MANAGED_NON_SPEC_FIELDS) - a plugin processor can't.
+            # Needs a real per-processor storage convention, planned as its own PR for a new release.
+            # The example plugin uses watch['processor_state_{name}'] meanwhile, see
+            # example_plugins/processor/wordcounter/processor.py
             self.__data['watching'][uuid].update(update_obj)
 
         # Immediate save
@@ -859,6 +866,9 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
             apply_extras['date_created'] = int(time.time())
 
         new_watch.update(apply_extras)
+
+        # Import, share-link and API callers can hand over "don't use the default" with no interval of its own
+        new_watch.ensure_valid_time_between_check()
 
         # Promote a pre-seeded directory into this watch's data_dir via a single rename()
         # (cheap: same filesystem, no copy). The seed must already be in final on-disk format.

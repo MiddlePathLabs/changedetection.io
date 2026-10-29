@@ -640,6 +640,13 @@ def _jinja2_filter_format_duration(seconds):
     return ", ".join(parts)
 
 
+@app.template_global('watch_list_extra_text')
+def _watch_list_extra_text(watch):
+    from changedetectionio.pluggy_interface import collect_watch_list_extra_text
+
+    return collect_watch_list_extra_text(watch)
+
+
 @app.template_filter('fetcher_status_icons')
 def _jinja2_filter_fetcher_status_icons(fetcher_name):
     """Get status icon HTML for a given fetcher.
@@ -987,7 +994,7 @@ def changedetection_app(config=None, datastore_o=None):
     watch_api.add_resource(
         SystemInfo,
         '/api/v1/systeminfo',
-        resource_class_kwargs={'datastore': datastore, 'update_q': update_q},
+        resource_class_kwargs={'datastore': datastore, 'update_q': update_q, 'new_version_available': app.config['NEW_VERSION_AVAILABLE']},
     )
 
     watch_api.add_resource(Import, '/api/v1/import', resource_class_kwargs={'datastore': datastore})
@@ -1008,6 +1015,14 @@ def changedetection_app(config=None, datastore_o=None):
     )
 
     watch_api.add_resource(Spec, '/api/v1/full-spec')
+
+    # processor_state_{name} providers for the watch API GET/list
+    from changedetectionio.pluggy_interface import register_builtin_api_plugins
+    register_builtin_api_plugins()
+
+    # Processors' own plugin hooks and their built-in implementations (e.g. the restock charts)
+    from changedetectionio.processors import register_processor_plugin_hooks
+    register_processor_plugin_hooks()
 
     @login_manager.user_loader
     def user_loader(email):
@@ -1812,10 +1827,13 @@ def ticker_thread_check_time_launch_checks():
                     continue
 
             # If they supplied an individual entry minutes to threshold.
+            # A watch that opted out of the defaults but has no interval of its own (all None/0, e.g. from
+            # an import, restore or hand-edited watch.json) must fall back to the system default,
+            # otherwise threshold is 0 and it is rechecked on every scheduler pass.
             threshold = (
                 recheck_time_system_seconds
                 if watch.get('time_between_check_use_default')
-                else watch.threshold_seconds()
+                else watch.threshold_seconds() or recheck_time_system_seconds
             )
 
             # #580 - Jitter plus/minus amount of time to make the check seem more random to the server
