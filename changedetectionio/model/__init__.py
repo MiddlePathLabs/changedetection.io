@@ -214,7 +214,6 @@ class watch_base(dict):
             'llm_change_summary_mode': 'replace',  # 'replace' the inherited prompt, or 'append' to it
             'llm_evaluation_cache': {},      # {sha256(intent+diff): {important, summary}} - evaluated once, cached
             'llm_intent': '',                # Plain-English description of what the user cares about (change filter)
-            'llm_prefilter': None,           # Unused - the never-wired AI pre-filter; kept so stored watches still load (see llm/assist.py suggest_filters)
             'method': 'GET',
             'notification_alert_count': 0,
             'check_failure_notification_send': False,

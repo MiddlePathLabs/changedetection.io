@@ -193,6 +193,12 @@ class TestParseEvalResponse:
         raw = 'Answer { see below:\n{"important": false, "summary": "footer only"}'
         assert parse_eval_response(raw)['summary'] == 'footer only'
 
+    @pytest.mark.parametrize('raw', ['', 'this is not json at all', '{"important": true, "summ', '[1, 2]'])
+    def test_unusable_response_raises(self, raw):
+        """No important=False fallback: that would suppress the notification. evaluator.py fails open."""
+        with pytest.raises(ValueError):
+            parse_eval_response(raw)
+
     def test_truthy_integer_coerced_to_bool(self):
         raw = '{"important": 1, "summary": "yes"}'
         result = parse_eval_response(raw)

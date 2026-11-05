@@ -37,8 +37,11 @@ DEFAULT_LOCAL_TIMEOUT = int(os.getenv('LLM_LOCAL_TIMEOUT', 1800))
 # NOT all GPT models: gpt-4o, gpt-4-turbo and gpt-3.5-turbo take temperature normally. It is
 # reasoning that forbids it. gpt-5 reports "only temperature=1 is supported unless
 # reasoning_effort resolves to 'none'" - we never set reasoning_effort=none, so it is always
-# in that state for us.
-_NO_TEMPERATURE_MODEL_KEYWORDS = ('flash-lite', 'thinking-exp', 'o1', 'o3', 'o4', 'gpt-5')
+# in that state for us. Claude 5.x (haiku/sonnet/opus/fable) refuses sampling params itself, not
+# because of thinking: Opus 5/5.5, Sonnet 5 and Fable reject any temperature, Haiku 5.5 and
+# Sonnet 5.5 any non-default one (which our 0 is).
+_NO_TEMPERATURE_MODEL_KEYWORDS = ('flash-lite', 'thinking-exp', 'o1', 'o3', 'o4', 'gpt-5',
+                                  'haiku-5', 'sonnet-5', 'opus-5', 'fable-5')
 
 DEFAULT_RETRIES = 3
 
@@ -227,8 +230,12 @@ def completion(  # noqa: C901
             kwargs['extra_headers'] = {'Authorization': 'Bearer'}
             logger.debug(f"LLM client: keyless local endpoint {api_base!r} — sending tokenless Bearer")
     if extra_body:
-        # Copied: the 400-retry path below strips keys out of it in place.
-        kwargs['extra_body'] = copy.deepcopy(extra_body)
+        extra_body = copy.deepcopy(extra_body)
+        # Anthropic takes thinking as a top-level field and 400s on extra_body ("Extra inputs are not permitted")
+        if 'thinking' in extra_body and (_m_lower.startswith('claude') or _m_lower.startswith('anthropic/')):
+            kwargs['thinking'] = extra_body.pop('thinking')
+        if extra_body:
+            kwargs['extra_body'] = extra_body
 
     _retryable = tuple(
         cls for cls in (
@@ -385,6 +392,10 @@ def completion(  # noqa: C901
             # them and retry once.
             if not _stripped_sampling:
                 dropped = [p for p in _sampling_params if kwargs.pop(p, None) is not None]
+                # Only when the error is about it, so an unrelated 400 (prompt too long) isn't retried
+                if 'thinking' in kwargs and 'thinking' in str(e).lower():
+                    kwargs.pop('thinking')
+                    dropped.append('thinking')
                 extra_body = kwargs.get('extra_body')
                 if isinstance(extra_body, dict):
                     gen_cfg = extra_body.get('generationConfig')

@@ -1,7 +1,7 @@
 """
 LLM evaluation orchestration.
 
-Two public entry points:
+Public entry point:
   - evaluate_change(watch, datastore, diff, current_snapshot) — per-change evaluation
 
 Intent resolution: watch.llm_intent → first tag with llm_intent whose AI switch is "on"
@@ -274,8 +274,12 @@ def fit_diff_to_budget_with_coverage(diff: str, max_chars: int) -> tuple[str, bo
     return fitted, fitted != diff
 
 
-def _thinking_extra_body(model: str, budget: int) -> dict | None:
+def _thinking_extra_body(model: str, budget: int, llm_cfg: dict | None = None) -> dict | None:
     """Return litellm extra_body to control thinking for models that support it.
+
+    Self-hosted servers (Ollama, OpenAI-compatible: llama.cpp, vLLM, LM Studio) take no per-request budget, only
+    on/off, so that's its own opt-in (local_thinking_off, #4638). Not the budget: it defaults to Off, following it
+    would switch thinking off for every existing self-hosted user.
 
     The `thinkingConfig.thinkingBudget` payload is Gemini-specific (Anthropic and
     OpenAI reasoning models use different parameters), so we gate on the gemini/
@@ -283,7 +287,33 @@ def _thinking_extra_body(model: str, budget: int) -> dict | None:
     "does this model think?" decision. That picks up new Gemini variants and
     rolling aliases (`gemini-flash-latest`, etc.) as litellm's registry tracks
     them, without us hardcoding model names here.
+
+    Claude 5.x thinks by default and has no token budget any more (budget_tokens is a 400), so for Anthropic
+    only Off (0) does anything: thinking={'type': 'disabled'} on Haiku/Sonnet 5.x, or 'between_tools' on
+    Sonnet 5.5 which rejects 'disabled'. Left alone: Opus 5 (with thinking disabled it can leak <thinking>
+    tags into the answer), Opus 5.5 / Fable (thinking can't be switched off) and 4.x (no thinking unless asked).
+    client.completion() lifts 'thinking' out of extra_body, Anthropic rejects unknown body fields.
     """
+    llm_cfg = llm_cfg or {}
+    if llm_cfg.get('local_thinking_off'):
+        if llm_cfg.get('provider_kind') == 'ollama':
+            return {'think': False}
+        if llm_cfg.get('provider_kind') == 'openai_compatible':
+            return {'chat_template_kwargs': {'enable_thinking': False}}
+    if model.startswith('claude') or model.startswith('anthropic/'):
+        if budget or not any(k in model.lower() for k in ('haiku-5', 'sonnet-5')):
+            return None
+        # litellm's registry has no flag for which models take 'between_tools'
+        if 'sonnet-5-5' in model.lower():
+            return {'thinking': {'type': 'between_tools'}}
+        try:
+            import litellm
+            info = litellm.get_model_info(model)
+            if not info.get('supports_adaptive_thinking') or info.get('thinking_always_on'):
+                return None
+        except Exception:
+            return None
+        return {'thinking': {'type': 'disabled'}}
     if not model.startswith('gemini/'):
         return None
     if 'flash-lite' in model.lower():
@@ -314,7 +344,7 @@ def _cached_system(text: str, model: str = '') -> dict:
     return {'role': 'system', 'content': text}
 
 
-# Output-token cap for the JSON-returning calls (intent eval, preview, setup/prefilter).
+# Output-token cap for the JSON-returning calls (intent eval, preview).
 # Mirrors client.py's _MAX_COMPLETION_TOKENS so the multiplier helper has a base value
 # to scale; cloud-LLM users hit this default unmodified, preserving prior cost defaults.
 JSON_RESPONSE_MAX_TOKENS = 400
@@ -366,10 +396,11 @@ REASONING_MODEL_KEYWORDS = (
     # Groq, xAI, Mistral...). Their answer lands after the chain-of-thought, same problem.
     'deepseek-r1', 'deepseek-reasoner', 'qwq', 'qwen3', 'magistral', 'grok-3-mini', 'grok-4',
     'gpt-oss', 'gemini-2.5-pro', 'gemini-3',
+    'haiku-5', 'sonnet-5', 'opus-5', 'fable-5',
 )
 
-# Claude only reasons when extended thinking is requested, which we never do, so litellm's
-# supports_reasoning=True for it must not bump its cap.
+# Older Claude families only reason when extended thinking is requested.
+# Claude 5.x and Fable are handled by the keywords above.
 _REASONING_OPT_IN_ONLY_PREFIXES = ('claude', 'anthropic/', 'bedrock/anthropic', 'vertex_ai/claude')
 
 
@@ -1003,7 +1034,7 @@ def summarise_change(watch, datastore, diff: str, current_snapshot: str = '') ->
             status='budget_exceeded', coverage='partial' if diff_truncated else 'complete',
             model=cfg.get('model', ''), error='Monthly or per-watch AI token budget reached.',
         )
-    _extra_body = _thinking_extra_body(cfg['model'], settings.thinking_budget)
+    _extra_body = _thinking_extra_body(cfg['model'], settings.thinking_budget, cfg)
 
     try:
         _resp = measured_completion('summary', datastore, watch,
@@ -1096,7 +1127,7 @@ def preview_extract(watch, datastore, content: str) -> dict | None:
             api_base=cfg.get('api_base'),
             timeout=resolve_llm_timeout(cfg),
             max_tokens=apply_local_token_multiplier(JSON_RESPONSE_MAX_TOKENS, cfg),
-            extra_body=_thinking_extra_body(cfg['model'], settings.thinking_budget),
+            extra_body=_thinking_extra_body(cfg['model'], settings.thinking_budget, cfg),
             debug=settings.debug,
         )
         record_usage('preview', datastore, watch, _resp, model=cfg['model'], cfg=cfg)
@@ -1282,7 +1313,7 @@ def evaluate_change(watch, datastore, diff: str, current_snapshot: str = '', *,
             api_base=cfg.get('api_base'),
             timeout=resolve_llm_timeout(cfg),
             max_tokens=apply_local_token_multiplier(JSON_RESPONSE_MAX_TOKENS, cfg),
-            extra_body=_thinking_extra_body(cfg['model'], settings.thinking_budget),
+            extra_body=_thinking_extra_body(cfg['model'], settings.thinking_budget, cfg),
             debug=settings.debug,
         )
         record_usage(operation, datastore, metrics_watch, _resp, model=cfg['model'], cfg=cfg)
