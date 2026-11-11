@@ -881,6 +881,9 @@ jobs:
               zlib1g-dev
           
           # Checkout old version and create datastore
+          # Forks don't carry upstream's tags, fetch the one we need from upstream when it's missing
+          git rev-parse -q --verify refs/tags/0.49.1 >/dev/null || \
+            git fetch --no-tags https://github.com/dgtlmoon/changedetection.io.git refs/tags/0.49.1:refs/tags/0.49.1
           git checkout 0.49.1
           python3 -m venv .venv
           source .venv/bin/activate

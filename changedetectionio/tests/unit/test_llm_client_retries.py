@@ -8,6 +8,7 @@ Retry behaviour of llm.client.completion():
 import unittest
 from unittest.mock import MagicMock, patch
 
+import httpx
 import litellm
 
 from changedetectionio.llm import client as m
@@ -21,7 +22,8 @@ def _resp(text='ok', finish='stop', total=10, prompt=6, completion=4):
 
 
 def _http_response(status, headers=None):
-    return MagicMock(status_code=status, headers=headers or {})
+    # A real httpx.Response: litellm >= 1.109 replaces anything else with an empty one (dropping retry-after)
+    return httpx.Response(status, headers=headers or {}, request=httpx.Request('POST', 'https://llm.example.com'))
 
 
 MSGS = [{'role': 'user', 'content': 'hi'}]
