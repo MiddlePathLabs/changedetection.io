@@ -43,7 +43,8 @@
     <section aria-labelledby="replay-estimate-heading">
         <h2 id="replay-estimate-heading">{{ _('Estimated replay cost') }}</h2>
         <dl>
-            <dt>{{ _('Current intent') }}</dt><dd>{{ current_intent or _('Not configured') }}</dd>
+            <dt>{{ _('Current intent') }}</dt>
+            <dd>{{ current_intent or _('Not configured') }}</dd>
             <dt>{{ _('Proposed intent') }}</dt><dd>{{ prepared.proposed_intent }}</dd>
             <dt>{{ _('Runnable transitions') }}</dt><dd>{{ prepared.transitions|length }}</dd>
             <dt>{{ _('Dispatches before budget checks') }}</dt><dd>{{ estimate.calls }}</dd>
@@ -83,7 +84,8 @@
                     <h4 id="replay-{{ loop.index }}-{{ item.transition.version }}">{{ _(label) }}</h4>
                     {% if result %}
                     <dl>
-                        <dt>{{ _('Decision') }}</dt><dd>{{ _('Alert') if result.important else _('Suppress') }}</dd>
+                        <dt>{{ _('Decision') }}</dt>
+                        <dd>{{ _('Alert') if result.important else _('Suppress') }}</dd>
                         <dt>{{ _('Status') }}</dt><dd>{{ result.status }}</dd>
                         <dt>{{ _('Coverage') }}</dt><dd>{{ result.coverage }}</dd>
                     </dl>

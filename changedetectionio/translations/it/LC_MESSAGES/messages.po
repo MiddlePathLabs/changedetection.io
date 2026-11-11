@@ -6156,7 +6156,7 @@ msgstr ""
 
 #: changedetectionio/templates/edit/include_ai_assist.html
 #, python-format
-msgid "With these rules, %(n)s of the last %(m)s changes would not have been reported."
+msgid "With these rules, %(avoided)s of the last %(checked)s changes would not have been reported."
 msgstr ""
 
 #: changedetectionio/templates/edit/include_ai_assist.html

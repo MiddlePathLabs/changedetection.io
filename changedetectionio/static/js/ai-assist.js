@@ -107,7 +107,7 @@ $(function () {
         } else if (kind === 'noise') {
             groups.push(renderGroup('ignore_text', data.ignore_text));
             if (data.ignore_text && data.ignore_text.length && data.diffs_checked) {
-                notes.push($('<p>').text((t.avoided || '').replace('%(n)s', data.alerts_avoided).replace('%(m)s', data.diffs_checked)));
+                notes.push($('<p>').text((t.avoided || '').replace('%(avoided)s', data.alerts_avoided).replace('%(checked)s', data.diffs_checked)));
             }
         } else if (kind === 'tags') {
             const items = (data.existing || []).map(v => ({value: v}))
