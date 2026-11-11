@@ -1,6 +1,7 @@
 import json
 import asyncio
 import queue
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -89,13 +90,15 @@ def test_worker_baseline_saves_two_suppressions_then_alert_with_own_diffs(client
 
 def test_actual_worker_progression_saves_suppressed_baselines_without_notifications(client, monkeypatch):
     datastore = client.application.config['DATASTORE']
-    app = client.application
-    app.config.exit.clear()
+    # The worker only reads app.config.exit. Give it its own event: setting the live app's
+    # exit event stops the server's notification runner for every later test on this worker.
+    app = SimpleNamespace(config=SimpleNamespace(exit=threading.Event()))
     monkeypatch.setenv('WORKER_MAX_JOBS', '20')
     monkeypatch.setenv('WORKER_MAX_RUNTIME', '30')
-    datastore.data['settings']['application']['llm'] = {
+    # monkeypatch restores the shared datastore's LLM settings when the test ends
+    monkeypatch.setitem(datastore.data['settings']['application'], 'llm', {
         'enabled': True, 'model': 'fixture/model', 'api_key': 'not-used',
-    }
+    })
     uuid = datastore.add_watch(url='https://example.com/b1-worker-real', extras={
         'paused': True, 'llm_intent': 'flag price changes',
     })
@@ -168,7 +171,6 @@ def test_actual_worker_progression_saves_suppressed_baselines_without_notificati
             ),
             timeout=10,
         ))
-    app.config.exit.clear()
 
     watch = datastore.data['watching'][uuid]
     versions = list(watch.history.keys())
