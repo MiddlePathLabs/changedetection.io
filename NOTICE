@@ -15,3 +15,4 @@ dependency offers a choice of licence, we use it under:
 
   feedgen    - BSD          (offered as BSD or LGPLv3+)
   paho-mqtt  - BSD-3-Clause (offered as EPL-2.0 or BSD-3-Clause)
+  tld        - MPL-1.1      (offered as MPL-1.1, GPL-2.0 or LGPL-2.1+; via scrapling)

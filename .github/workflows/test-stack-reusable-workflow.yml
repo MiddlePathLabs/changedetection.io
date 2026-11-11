@@ -66,9 +66,11 @@ jobs:
           # bypassed so EXTRA_PACKAGES cannot pull in the opt-in AGPL osint plugin.
           # --partial-match is required: plain --fail-on is an exact string match and
           # would silently miss declarations like "GPL-2.0-or-later".
+          # --ignore-packages: multi-licensed packages used under a non-copyleft option recorded in NOTICE
+          # (tld, pulled in by scrapling: "MPL-1.1 OR GPL-2.0-only OR LGPL-2.1-or-later", used under MPL-1.1).
           docker run --rm --entrypoint /bin/bash test-changedetectionio -c '
             pip install --quiet pip-licenses &&
-            pip-licenses --partial-match \
+            pip-licenses --partial-match --ignore-packages tld \
               --fail-on="GPL-2.0;GPL-3.0;AGPL;GNU General Public License;GNU Affero General Public License"
           '
 
