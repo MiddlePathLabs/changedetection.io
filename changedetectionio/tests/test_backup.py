@@ -56,8 +56,9 @@ def test_backup(client, live_server, measure_memory_usage, datastore_path):
     # Check for UUID-based txt files (history, snapshot, and last-checksum)
     uuid4hex_txt = re.compile('^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}.*txt', re.I)
     txt_files = list(filter(uuid4hex_txt.match, l))
-    # Should be three txt files in the archive (history, snapshot, and last-checksum)
-    assert len(txt_files) == 3
+    # Should be four txt files in the archive (history, history.txt.initial, snapshot, and last-checksum)
+    assert len(txt_files) == 4
+    assert any(f.endswith('/history.txt.initial') for f in txt_files)
 
     # Check for watch.json files (new format)
     uuid4hex_json = re.compile('^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}/watch\.json$', re.I)

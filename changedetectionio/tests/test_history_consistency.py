@@ -106,7 +106,8 @@ def test_consistent_history(client, live_server, measure_memory_usage, datastore
 
         # Find the snapshot one
         for fname in files_in_watch_dir:
-            if fname != 'history.txt' and fname != 'watch.json' and fname != 'last-checksum.txt' and 'html' not in fname:
+            # history.txt.initial (fork): marker holding the first version's timestamp, not a snapshot
+            if fname not in ('history.txt', 'history.txt.initial', 'watch.json', 'last-checksum.txt') and 'html' not in fname:
                 if strtobool(os.getenv("TEST_WITH_BROTLI")):
                     assert fname.endswith('.br'), "Forced TEST_WITH_BROTLI then it should be a .br filename"
 

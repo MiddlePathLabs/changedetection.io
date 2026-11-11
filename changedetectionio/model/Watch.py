@@ -346,9 +346,9 @@ class model(EntityPersistenceMixin, watch_base):
     @property
     def viewed(self):
         latest_alert = self._latest_non_suppressed_history_key()
-        if latest_alert is None:
-            # Preserve the existing first-snapshot semantics. There is no change
-            # to view until a second history entry exists.
+        if latest_alert is None or (latest_alert == 0 and self.history_n < 2):
+            # Preserve the existing first-snapshot semantics (no history, or only the
+            # initial baseline): viewed only once last_viewed has caught up with it.
             return bool(int(self['last_viewed'])) and int(self['last_viewed']) >= int(self.newest_history_key)
         if latest_alert == 0:
             # Every post-baseline history entry is an explicitly suppressed

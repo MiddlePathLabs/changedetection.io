@@ -801,11 +801,11 @@ def strip_ignore_text(content, wordlist, mode="content", regex_timeout=None):
             if l.lower() in line.lower():
                 got_match = True
 
-            if not got_match:
-                for r in ignore_regex:
-                    search_kwargs = {'timeout': regex_timeout} if regex_timeout is not None else {}
-                    if r.search(line, **search_kwargs):
-                        got_match = True
+        if not got_match:
+            search_kwargs = {'timeout': regex_timeout} if regex_timeout is not None else {}
+            for r in ignore_regex:
+                if r.search(line, **search_kwargs):
+                    got_match = True
 
         if got_match:
             ignored_lines.append(line_index)

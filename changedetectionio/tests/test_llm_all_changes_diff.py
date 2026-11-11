@@ -13,6 +13,7 @@ from unittest.mock import patch, call
 
 from flask import url_for
 
+from changedetectionio.llm.evaluator import _summary_result
 from changedetectionio.tests.util import delete_all_watches, fetch_llm_summary
 
 
@@ -57,7 +58,7 @@ def test_all_changes_sends_multi_segment_diff_to_llm(
 
     def fake_summarise(watch, datastore, diff, current_snapshot=None):
         captured_diff['diff'] = diff
-        return 'Multi-step summary.'
+        return _summary_result('Multi-step summary.')
 
     with patch('changedetectionio.llm.evaluator.summarise_change', side_effect=fake_summarise):
         res = fetch_llm_summary(client, url_for(
@@ -95,7 +96,7 @@ def test_default_mode_sends_single_diff_to_llm(
 
     def fake_summarise(watch, datastore, diff, current_snapshot=None):
         captured_diff['diff'] = diff
-        return 'Single-range summary.'
+        return _summary_result('Single-range summary.')
 
     with patch('changedetectionio.llm.evaluator.summarise_change', side_effect=fake_summarise):
         res = fetch_llm_summary(client, url_for(
@@ -127,7 +128,7 @@ def test_all_changes_and_direct_use_separate_cache_keys(
 
     def fake_summarise(watch, datastore, diff, current_snapshot=None):
         call_count['n'] += 1
-        return f'Summary call #{call_count["n"]}'
+        return _summary_result(f'Summary call #{call_count["n"]}')
 
     with patch('changedetectionio.llm.evaluator.summarise_change', side_effect=fake_summarise):
         # First call: all_changes=1
@@ -164,7 +165,7 @@ def test_all_changes_result_is_cached(
 
     def fake_summarise(watch, datastore, diff, current_snapshot=None):
         call_count['n'] += 1
-        return 'Cached multi-step summary.'
+        return _summary_result('Cached multi-step summary.')
 
     with patch('changedetectionio.llm.evaluator.summarise_change', side_effect=fake_summarise):
         r1 = fetch_llm_summary(client, url_for(

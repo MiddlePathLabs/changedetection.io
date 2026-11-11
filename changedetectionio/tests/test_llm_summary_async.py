@@ -239,8 +239,9 @@ def test_a_job_finishing_mid_request_is_not_reported_as_idle(
     url = url_for('ui.ui_diff.diff_llm_summary', uuid=uuid,
                   from_version='5600000000', to_version='5600000001')
 
-    with patch.object(type(watch), 'get_llm_diff_summary',
-                      side_effect=['', 'Summary that landed mid-request.']):
+    with patch.object(type(watch), 'get_llm_diff_summary_result',
+                      side_effect=[None, {'text': 'Summary that landed mid-request.', 'status': 'cached',
+                                          'coverage': 'complete'}]):
         res = client.get(url)
 
     assert res.status_code == 200

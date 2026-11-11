@@ -632,7 +632,8 @@ class perform_site_check(difference_detection_processor):
 
         # Browsers show PDFs in their built-in viewer, so a fetcher may only have the viewer's HTML.
         # Checked before the checksum skip, otherwise the unchanging viewer HTML would be "unchanged" every time
-        ctype_header = self.fetcher.get_all_headers().get('content-type', DEFAULT_WHEN_NO_CONTENT_TYPE_HEADER).lower()
+        # `or`: a header/watch value of None (e.g. the preview passing on an unknown content-type) means the default too
+        ctype_header = (self.fetcher.get_all_headers().get('content-type') or DEFAULT_WHEN_NO_CONTENT_TYPE_HEADER).lower()
         if watch.is_pdf or 'application/pdf' in ctype_header:
             if not self.fetcher.raw_content or b'%PDF' not in self.fetcher.raw_content[:1024]:
                 raise PDFNotAvailableFromFetcher(
